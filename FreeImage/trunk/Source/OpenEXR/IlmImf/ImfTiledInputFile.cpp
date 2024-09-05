@@ -149,6 +149,11 @@ struct TileBuffer
      TileBuffer (Compressor * const comp);
     ~TileBuffer ();
 
+    TileBuffer (const TileBuffer& other) = delete;
+    TileBuffer& operator = (const TileBuffer& other) = delete;
+    TileBuffer (TileBuffer&& other) = delete;
+    TileBuffer& operator = (TileBuffer&& other) = delete;
+
     inline void		wait () {_sem.wait();}
     inline void		post () {_sem.post();}
 
@@ -243,6 +248,16 @@ struct TiledInputFile::Data: public Mutex
      Data (int numThreads);
     ~Data ();
 
+    Data (const Data& other) = delete;
+    Data& operator = (const Data& other) = delete;
+    Data (Data&& other) = delete;
+    Data& operator = (Data&& other) = delete;
+
+    static const int gLargeChunkTableSize = 1024*1024;
+    void validateStreamSize();                       // throw an exception if the file is significantly
+                                                     // smaller than the data/tile geometry would require
+
+
     inline TileBuffer * getTileBuffer (int number);
 					    // hash function from tile indices
 					    // into our vector of tile buffers
@@ -255,6 +270,7 @@ TiledInputFile::Data::Data (int numThreads):
     partNumber (-1),
     multiPartBackwardSupport(false),
     numThreads(numThreads),
+    multiPartFile(nullptr),
     memoryMapped(false),
     _streamData(NULL),
     _deleteStream(false)
@@ -287,6 +303,58 @@ TiledInputFile::Data::getTileBuffer (int number)
     return tileBuffers[number % tileBuffers.size()];
 }
 
+
+
+//
+// avoid allocating excessive memory due to large lineOffsets table size.
+// If the chunktablesize claims to be large,
+// check the file is big enough to contain the table before allocating memory
+// in the bytesPerLineTable and the lineOffsets table.
+// Attempt to read the last entry in the first level of the table. Either the seekg() or the read()
+// call will throw an exception if the file is much too small to contain the table.
+//
+
+// assumes the input stream pointer is at (or before) the beginning of the chunk table
+
+
+void
+TiledInputFile::Data::validateStreamSize()
+{
+    const TileDescription& td = header.tileDescription();
+    Int64 chunkCount;
+
+    if (td.mode==RIPMAP_LEVELS)
+    {
+        // use slow function to calculate exact size of ripmap
+        chunkCount = getTiledChunkOffsetTableSize(header);
+    }
+    else
+    {
+        // for ONE_LEVEL image, calculate exact number of tiles
+        // MIPMAP_LEVELS images will have roughly 1/3 more tiles than this
+        // but 'chunkCount' can be less than the real offset table size for a meaningful sanity check
+        //
+        const Box2i &dataWindow = header.dataWindow();
+        Int64 tileWidth = td.xSize;
+        Int64 tileHeight = td.ySize;
+
+        Int64 tilesX = (static_cast<Int64>(dataWindow.max.x+1-dataWindow.min.x) + tileWidth -1) / tileWidth;
+        Int64 tilesY = (static_cast<Int64>(dataWindow.max.y+1-dataWindow.min.y) + tileHeight -1) / tileHeight;
+
+        chunkCount = tilesX*tilesY;
+    }
+
+    if (chunkCount > gLargeChunkTableSize)
+    {
+
+       Int64 pos = _streamData->is->tellg();
+       _streamData->is->seekg(pos + (chunkCount-1)*sizeof(Int64));
+       Int64 temp;
+       OPENEXR_IMF_INTERNAL_NAMESPACE::Xdr::read <OPENEXR_IMF_INTERNAL_NAMESPACE::StreamIO> (*_streamData->is, temp);
+       _streamData->is->seekg(pos);
+    }
+
+}
 
 namespace {
 
@@ -377,7 +445,7 @@ readTileData (InputStreamMutex *streamData,
     if (levelY != ly)
         throw IEX_NAMESPACE::InputExc ("Unexpected tile y level number coordinate.");
 
-    if (dataSize > (int) ifd->tileBufferSize)
+    if (dataSize < 0 || dataSize > static_cast<int>(ifd->tileBufferSize) )
         throw IEX_NAMESPACE::InputExc ("Unexpected tile block length.");
 
     //
@@ -598,10 +666,11 @@ TileBufferTask::execute ()
                     // The frame buffer contains a slice for this channel.
                     //
     
-                    char *writePtr = slice.base +
+                    intptr_t base = reinterpret_cast<intptr_t>(slice.base);
+                    char *writePtr = reinterpret_cast<char*>(base +
                                      (y - yOffset) * slice.yStride +
                                      (tileRange.min.x - xOffset) *
-                                     slice.xStride;
+                                     slice.xStride);
 
                     char *endPtr = writePtr +
                                    (numPixelsPerScanLine - 1) * slice.xStride;
@@ -703,61 +772,57 @@ TiledInputFile::TiledInputFile (const char fileName[], int numThreads):
     IStream* is = 0;
     try
     {
-        is = new StdIFStream (fileName);
-	readMagicNumberAndVersionField(*is, _data->version);
-
-	//
-        // Backward compatibility to read multpart file.
-        //
-	if (isMultiPart(_data->version))
-	{
-	    compatibilityInitialize(*is);
-	    return;
-	}
-
-	_data->_streamData = new InputStreamMutex();
-	_data->_streamData->is = is;
-	_data->header.readFrom (*_data->_streamData->is, _data->version);
-	initialize();
-        //read tile offsets - we are not multipart or deep
-        _data->tileOffsets.readFrom (*(_data->_streamData->is), _data->fileIsComplete,false,false);
-	_data->_streamData->currentPosition = _data->_streamData->is->tellg();
-    }
-    catch (IEX_NAMESPACE::BaseExc &e)
-    {
-        if (_data->_streamData != 0)
+        try
         {
-            if (_data->_streamData->is != 0)
+            is = new StdIFStream (fileName);
+            readMagicNumberAndVersionField(*is, _data->version);
+
+            //
+            // Backward compatibility to read multpart file.
+            //
+            if (isMultiPart(_data->version))
             {
-                delete _data->_streamData->is;
-                _data->_streamData->is = is = 0;
+                compatibilityInitialize(*is);
+                return;
             }
 
-            delete _data->_streamData;
+            _data->_streamData = new InputStreamMutex();
+            _data->_streamData->is = is;
+            _data->header.readFrom (*_data->_streamData->is, _data->version);
+
+            initialize();
+            //read tile offsets - we are not multipart or deep
+            _data->tileOffsets.readFrom (*(_data->_streamData->is), _data->fileIsComplete,false,false);
+            _data->_streamData->currentPosition = _data->_streamData->is->tellg();
         }
-
-        if (is != 0)
-            delete is;
-
-	REPLACE_EXC (e, "Cannot open image file "
-			"\"" << fileName << "\". " << e);
-	throw;
+        catch (IEX_NAMESPACE::BaseExc &e)
+        {
+            REPLACE_EXC (e, "Cannot open image file "
+                    "\"" << fileName << "\". " << e.what());
+            throw;
+        }
     }
     catch (...)
     {
-        if ( _data->_streamData != 0)
+        if (!_data->memoryMapped)
         {
-            if ( _data->_streamData->is != 0)
+            for (size_t i = 0; i < _data->tileBuffers.size(); i++)
             {
-                delete _data->_streamData->is;
-                _data->_streamData->is = is = 0;
+                if(_data->tileBuffers[i])
+                {
+                   delete [] _data->tileBuffers[i]->buffer;
+                }
             }
-
+        }
+        if ( _data->_streamData != 0 && !isMultiPart(_data->version))
+        {
+            delete _data->_streamData->is;
+            _data->_streamData->is = is = 0;
             delete _data->_streamData;
         }
 
-        if (is != 0)
-            delete is;
+        delete is;
+        delete _data;
         throw;
     }
 }
@@ -776,38 +841,48 @@ TiledInputFile::TiledInputFile (OPENEXR_IMF_INTERNAL_NAMESPACE::IStream &is, int
 
     try
     {
-	readMagicNumberAndVersionField(is, _data->version);
-
-	//
-	// Backward compatibility to read multpart file.
-	//
-	if (isMultiPart(_data->version))
+        try
         {
-	    compatibilityInitialize(is);
-            return;
+            readMagicNumberAndVersionField(is, _data->version);
+
+            //
+            // Backward compatibility to read multpart file.
+            //
+            if (isMultiPart(_data->version))
+            {
+                compatibilityInitialize(is);
+                return;
+            }
+
+            streamDataCreated = true;
+            _data->_streamData = new InputStreamMutex();
+            _data->_streamData->is = &is;
+            _data->header.readFrom (*_data->_streamData->is, _data->version);
+            initialize();
+            // file is guaranteed to be single part, regular image
+            _data->tileOffsets.readFrom (*(_data->_streamData->is), _data->fileIsComplete,false,false);
+            _data->memoryMapped = _data->_streamData->is->isMemoryMapped();
+            _data->_streamData->currentPosition = _data->_streamData->is->tellg();
         }
-
-	streamDataCreated = true;
-	_data->_streamData = new InputStreamMutex();
-	_data->_streamData->is = &is;
-	_data->header.readFrom (*_data->_streamData->is, _data->version);
-	initialize();
-        // file is guaranteed to be single part, regular image
-        _data->tileOffsets.readFrom (*(_data->_streamData->is), _data->fileIsComplete,false,false);
-	_data->memoryMapped = _data->_streamData->is->isMemoryMapped();
-	_data->_streamData->currentPosition = _data->_streamData->is->tellg();
-    }
-    catch (IEX_NAMESPACE::BaseExc &e)
-    {
-        if (streamDataCreated) delete _data->_streamData;
-	delete _data;
-
-	REPLACE_EXC (e, "Cannot open image file "
-			"\"" << is.fileName() << "\". " << e);
-	throw;
+        catch (IEX_NAMESPACE::BaseExc &e)
+        {
+            REPLACE_EXC (e, "Cannot open image file "
+                    "\"" << is.fileName() << "\". " << e.what());
+            throw;
+        }
     }
     catch (...)
     {
+        if (!_data->memoryMapped)
+        {
+            for (size_t i = 0; i < _data->tileBuffers.size(); i++)
+            {
+                if( _data->tileBuffers[i])
+                {
+                   delete [] _data->tileBuffers[i]->buffer;
+                }
+            }
+        }
         if (streamDataCreated) delete _data->_streamData;
 	delete _data;
         throw;
@@ -831,13 +906,32 @@ TiledInputFile::TiledInputFile (const Header &header,
     // we have somehow got the header.
     //
 
-    _data->_streamData->is = is;
-    _data->header = header;
-    _data->version = version;
-    initialize();
-    _data->tileOffsets.readFrom (*(_data->_streamData->is),_data->fileIsComplete,false,false);
-    _data->memoryMapped = is->isMemoryMapped();
-    _data->_streamData->currentPosition = _data->_streamData->is->tellg();
+    try
+    {
+        _data->_streamData->is = is;
+        _data->header = header;
+        _data->version = version;
+        initialize();
+        _data->tileOffsets.readFrom (*(_data->_streamData->is),_data->fileIsComplete,false,false);
+        _data->memoryMapped = is->isMemoryMapped();
+        _data->_streamData->currentPosition = _data->_streamData->is->tellg();
+    }
+    catch(...)
+    {
+        if (!_data->memoryMapped)
+        {
+            for (size_t i = 0; i < _data->tileBuffers.size(); i++)
+            {
+                if(_data->tileBuffers[i])
+                {
+                     delete [] _data->tileBuffers[i]->buffer;
+                }
+            }
+        }
+        delete _data->_streamData;
+        delete _data;
+        throw; 
+    }
 }
 
 
@@ -845,7 +939,28 @@ TiledInputFile::TiledInputFile (InputPartData* part)
 {
     _data = new Data (part->numThreads);
     _data->_deleteStream=false;
-    multiPartInitialize(part);
+    try
+    {
+      multiPartInitialize(part);
+    }
+    catch(...)
+    {
+        if(_data)
+        {
+          if (!_data->memoryMapped)
+          {
+            for (size_t i = 0; i < _data->tileBuffers.size(); i++)
+            {
+                if(_data->tileBuffers[i])
+                {
+                   delete [] _data->tileBuffers[i]->buffer;
+                }
+            }
+          }
+          delete _data;
+        }
+        throw;
+    }
 }
 
 
@@ -902,7 +1017,10 @@ TiledInputFile::initialize ()
     {
         if (!isTiled (_data->version))
             throw IEX_NAMESPACE::ArgExc ("Expected a tiled file but the file is not tiled.");
-        
+
+        if (isNonImage (_data->version))
+            throw IEX_NAMESPACE::ArgExc ("File is not a regular tiled image.");
+
     }
     else
     {
@@ -914,6 +1032,15 @@ TiledInputFile::initialize ()
     
     _data->header.sanityCheck (true);
 
+    //
+    // before allocating memory for tile offsets, confirm file is large enough
+    // to contain tile offset table
+    // (for multipart files, the chunk offset table has already been read)
+    //
+    if (!isMultiPart(_data->version))
+    {
+        _data->validateStreamSize();
+    }
     _data->tileDesc = _data->header.tileDescription();
     _data->lineOrder = _data->header.lineOrder();
 
@@ -942,6 +1069,16 @@ TiledInputFile::initialize ()
     _data->maxBytesPerTileLine = _data->bytesPerPixel * _data->tileDesc.xSize;
 
     _data->tileBufferSize = _data->maxBytesPerTileLine * _data->tileDesc.ySize;
+
+    //
+    // OpenEXR has a limit of INT_MAX compressed bytes per tile
+    // disallow uncompressed tile sizes above INT_MAX too to guarantee file is written
+    //
+    if( _data->tileBufferSize > INT_MAX )
+    {
+        throw IEX_NAMESPACE::ArgExc ("Tile size too large for OpenEXR format");
+    }
+
 
     //
     // Create all the TileBuffers and allocate their internal buffers
@@ -1248,7 +1385,7 @@ TiledInputFile::readTiles (int dx1, int dx2, int dy1, int dy2, int lx, int ly)
     catch (IEX_NAMESPACE::BaseExc &e)
     {
         REPLACE_EXC (e, "Error reading pixel data from image "
-                        "file \"" << fileName() << "\". " << e);
+                     "file \"" << fileName() << "\". " << e.what());
         throw;
     }
 }
@@ -1306,6 +1443,11 @@ TiledInputFile::rawTileData (int &dx, int &dy,
         readNextTileData (_data->_streamData, _data, dx, dy, lx, ly,
 			  tileBuffer->buffer,
                           pixelDataSize);
+
+        if ( !isValidLevel(lx,ly) || !isValidTile (dx, dy, lx, ly) )
+            throw IEX_NAMESPACE::ArgExc ("File contains an invalid tile");
+
+
         if(isMultiPart(version()))
         {
             if (old_dx!=dx || old_dy !=dy || old_lx!=lx || old_ly!=ly)
@@ -1313,12 +1455,19 @@ TiledInputFile::rawTileData (int &dx, int &dy,
                 throw IEX_NAMESPACE::ArgExc ("rawTileData read the wrong tile");
             }
         }
+        else
+        {
+             if(!isValidTile (dx, dy, lx, ly) )
+             {
+                 throw IEX_NAMESPACE::IoExc ("rawTileData read an invalid tile");
+             }
+        }
         pixelData = tileBuffer->buffer;
     }
     catch (IEX_NAMESPACE::BaseExc &e)
     {
         REPLACE_EXC (e, "Error reading pixel data from image "
-			"file \"" << fileName() << "\". " << e);
+                     "file \"" << fileName() << "\". " << e.what());
         throw;
     }
 }
@@ -1406,7 +1555,7 @@ TiledInputFile::levelWidth (int lx) const
     catch (IEX_NAMESPACE::BaseExc &e)
     {
 	REPLACE_EXC (e, "Error calling levelWidth() on image "
-			"file \"" << fileName() << "\". " << e);
+                 "file \"" << fileName() << "\". " << e.what());
 	throw;
     }
 }
@@ -1423,7 +1572,7 @@ TiledInputFile::levelHeight (int ly) const
     catch (IEX_NAMESPACE::BaseExc &e)
     {
 	REPLACE_EXC (e, "Error calling levelHeight() on image "
-			"file \"" << fileName() << "\". " << e);
+                 "file \"" << fileName() << "\". " << e.what());
 	throw;
     }
 }
@@ -1479,7 +1628,7 @@ TiledInputFile::dataWindowForLevel (int lx, int ly) const
     catch (IEX_NAMESPACE::BaseExc &e)
     {
 	REPLACE_EXC (e, "Error calling dataWindowForLevel() on image "
-			"file \"" << fileName() << "\". " << e);
+                 "file \"" << fileName() << "\". " << e.what());
 	throw;
     }
 }
@@ -1509,7 +1658,7 @@ TiledInputFile::dataWindowForTile (int dx, int dy, int lx, int ly) const
     catch (IEX_NAMESPACE::BaseExc &e)
     {
 	REPLACE_EXC (e, "Error calling dataWindowForTile() on image "
-			"file \"" << fileName() << "\". " << e);
+                 "file \"" << fileName() << "\". " << e.what());
 	throw;
     }
 }

@@ -73,7 +73,6 @@ using IMATH_NAMESPACE::divp;
 using IMATH_NAMESPACE::modp;
 using std::string;
 using std::vector;
-using std::ifstream;
 using std::min;
 using std::max;
 using std::sort;
@@ -150,6 +149,11 @@ struct LineBuffer
 
     LineBuffer (Compressor * const comp);
     ~LineBuffer ();
+
+    LineBuffer (const LineBuffer& other) = delete;
+    LineBuffer& operator = (const LineBuffer& other) = delete;
+    LineBuffer (LineBuffer&& other) = delete;
+    LineBuffer& operator = (LineBuffer&& other) = delete;
 
     inline void		wait () {_sem.wait();}
     inline void		post () {_sem.post();}
@@ -239,6 +243,11 @@ struct ScanLineInputFile::Data: public Mutex
     
     Data (int numThreads);
     ~Data ();
+
+    Data (const Data& other) = delete;
+    Data& operator = (const Data& other) = delete;
+    Data (Data&& other) = delete;
+    Data& operator = (Data&& other) = delete;
     
     inline LineBuffer * getLineBuffer (int number); // hash function from line
     						    // buffer indices into our
@@ -305,7 +314,7 @@ reconstructLineOffsets (OPENEXR_IMF_INTERNAL_NAMESPACE::IStream &is,
 		lineOffsets[lineOffsets.size() - i - 1] = lineOffset;
 	}
     }
-    catch (...)
+    catch (...) //NOSONAR - suppress vulnerability reports from SonarCloud.
     {
 	//
 	// Suppress all exceptions.  This functions is
@@ -375,6 +384,8 @@ readPixelData (InputStreamMutex *streamData,
     //
 
     int lineBufferNumber = (minY - ifd->minY) / ifd->linesInBuffer;
+    if (lineBufferNumber < 0 || lineBufferNumber >= int(ifd->lineOffsets.size()))
+        THROW (IEX_NAMESPACE::InputExc, "Invalid scan line " << minY << " requested or missing.");
 
     Int64 lineOffset = ifd->lineOffsets[lineBufferNumber];
 
@@ -427,8 +438,8 @@ readPixelData (InputStreamMutex *streamData,
     if (yInFile != minY)
         throw IEX_NAMESPACE::InputExc ("Unexpected data block y coordinate.");
 
-    if (dataSize > (int) ifd->lineBufferSize)
-	throw IEX_NAMESPACE::InputExc ("Unexpected data block length.");
+    if (dataSize < 0 || dataSize > static_cast<int>(ifd->lineBufferSize) )
+        throw IEX_NAMESPACE::InputExc ("Unexpected data block length.");
 
     //
     // Read the pixel data.
@@ -522,18 +533,18 @@ LineBufferTask::execute ()
     
         if (_lineBuffer->uncompressedData == 0)
         {
-            int uncompressedSize = 0;
+            size_t uncompressedSize = 0;
             int maxY = min (_lineBuffer->maxY, _ifd->maxY);
     
             for (int i = _lineBuffer->minY - _ifd->minY;
                  i <= maxY - _ifd->minY;
 		 ++i)
 	    {
-                uncompressedSize += (int) _ifd->bytesPerLine[i];
+                uncompressedSize += _ifd->bytesPerLine[i];
 	    }
     
             if (_lineBuffer->compressor &&
-                _lineBuffer->dataSize < uncompressedSize)
+                static_cast<size_t>(_lineBuffer->dataSize) < uncompressedSize)
             {
                 _lineBuffer->format = _lineBuffer->compressor->format();
 
@@ -626,11 +637,11 @@ LineBufferTask::execute ()
                     //
     
                     char *linePtr  = slice.base +
-                                        divp (y, slice.ySampling) *
-                                        slice.yStride;
+                                        intptr_t( divp (y, slice.ySampling) ) *
+                                        intptr_t( slice.yStride );
     
-                    char *writePtr = linePtr + dMinX * slice.xStride;
-                    char *endPtr   = linePtr + dMaxX * slice.xStride;
+                    char *writePtr = linePtr + intptr_t( dMinX ) * intptr_t( slice.xStride );
+                    char *endPtr   = linePtr + intptr_t( dMaxX ) * intptr_t( slice.xStride );
                     
                     copyIntoFrameBuffer (readPtr, writePtr, endPtr,
                                          slice.xStride, slice.fill,
@@ -836,18 +847,18 @@ LineBufferTaskIIF::execute()
         
         if (_lineBuffer->uncompressedData == 0)
         {
-            int uncompressedSize = 0;
+            size_t uncompressedSize = 0;
             int maxY = min (_lineBuffer->maxY, _ifd->maxY);
             
             for (int i = _lineBuffer->minY - _ifd->minY;
             i <= maxY - _ifd->minY;
             ++i)
             {
-                uncompressedSize += (int) _ifd->bytesPerLine[i];
+                uncompressedSize += _ifd->bytesPerLine[i];
             }
             
             if (_lineBuffer->compressor &&
-                _lineBuffer->dataSize < uncompressedSize)
+                static_cast<size_t>(_lineBuffer->dataSize) < uncompressedSize)
             {
                 _lineBuffer->format = _lineBuffer->compressor->format();
                 
@@ -1096,8 +1107,6 @@ newLineBufferTask (TaskGroup *group,
 
 void ScanLineInputFile::initialize(const Header& header)
 {
-    try
-    {
         _data->header = header;
 
         _data->lineOrder = _data->header.lineOrder();
@@ -1111,6 +1120,12 @@ void ScanLineInputFile::initialize(const Header& header)
 
         size_t maxBytesPerLine = bytesPerLineTable (_data->header,
                                                     _data->bytesPerLine);
+        
+        if(maxBytesPerLine > INT_MAX)
+        {
+            throw IEX_NAMESPACE::InputExc("maximum bytes per scanline exceeds maximum permissible size");
+        }
+
 
         for (size_t i = 0; i < _data->lineBuffers.size(); i++)
         {
@@ -1130,6 +1145,10 @@ void ScanLineInputFile::initialize(const Header& header)
             for (size_t i = 0; i < _data->lineBuffers.size(); i++)
             {
                 _data->lineBuffers[i]->buffer = (char *) EXRAllocAligned(_data->lineBufferSize*sizeof(char),16);
+                if (!_data->lineBuffers[i]->buffer)
+                {
+                    throw IEX_NAMESPACE::LogicExc("Failed to allocate memory for scanline buffers");
+                }
             }
         }
         _data->nextLineBufferMinY = _data->minY - 1;
@@ -1142,13 +1161,6 @@ void ScanLineInputFile::initialize(const Header& header)
                               _data->linesInBuffer) / _data->linesInBuffer;
 
         _data->lineOffsets.resize (lineOffsetSize);
-    }
-    catch (...)
-    {
-        delete _data;
-        _data=NULL;
-        throw;
-    }
 }
 
 
@@ -1163,8 +1175,27 @@ ScanLineInputFile::ScanLineInputFile(InputPartData* part)
 
     _data->version = part->version;
 
-    initialize(part->header);
-
+    try
+    {
+       initialize(part->header);
+    }
+    catch(...)
+    {
+        if (!_data->memoryMapped)
+        {
+            for (size_t i = 0; i < _data->lineBuffers.size(); i++)
+            {
+                if( _data->lineBuffers[i] )
+                {
+                   EXRFreeAligned(_data->lineBuffers[i]->buffer);
+                   _data->lineBuffers[i]->buffer=nullptr;
+                }
+            }
+        }
+        
+        delete _data;
+        throw;
+    }
     _data->lineOffsets = part->chunkOffsets;
 
     _data->partNumber = part->partNumber;
@@ -1187,19 +1218,43 @@ ScanLineInputFile::ScanLineInputFile
     _streamData->is = is;
     _data->memoryMapped = is->isMemoryMapped();
 
-    initialize(header);
-    
-    //
-    // (TODO) this is nasty - we need a better way of working out what type of file has been used.
-    // in any case I believe this constructor only gets used with single part files
-    // and 'version' currently only tracks multipart state, so setting to 0 (not multipart) works for us
-    //
-    
-    _data->version=0;
-    readLineOffsets (*_streamData->is,
-                     _data->lineOrder,
-                     _data->lineOffsets,
-                     _data->fileIsComplete);
+    try
+    {
+
+        initialize(header);
+        
+        //
+        // (TODO) this is nasty - we need a better way of working out what type of file has been used.
+        // in any case I believe this constructor only gets used with single part files
+        // and 'version' currently only tracks multipart state, so setting to 0 (not multipart) works for us
+        //
+        
+        _data->version=0;
+        readLineOffsets (*_streamData->is,
+                        _data->lineOrder,
+                        _data->lineOffsets,
+                        _data->fileIsComplete);
+    }
+    catch(...)
+    {
+        if(_data)
+        {
+           if (!_data->memoryMapped)
+           {
+              for (size_t i = 0; i < _data->lineBuffers.size(); i++)
+              {
+                 if( _data->lineBuffers[i] )
+                 {
+                   EXRFreeAligned(_data->lineBuffers[i]->buffer);
+                   _data->lineBuffers[i]->buffer=nullptr;
+                 }
+              }
+           }
+        }
+        delete _streamData;
+        delete _data;
+        throw;
+    }
 }
 
 
@@ -1264,7 +1319,7 @@ detectOptimizationMode (const vector<sliceOptimizationData>& optData)
     OptimizationMode w;
     
     // need to be compiled with SSE optimisations: if not, just returns false
-#if IMF_HAVE_SSE2
+#ifdef IMF_HAVE_SSE2
     
     
     // only handle reading 3,4,6 or 8 channels
@@ -1416,6 +1471,18 @@ ScanLineInputFile::setFrameBuffer (const FrameBuffer &frameBuffer)
                   case OPENEXR_IMF_INTERNAL_NAMESPACE::UINT :
                       offset+=2;
                       break;
+                  case OPENEXR_IMF_INTERNAL_NAMESPACE::NUM_PIXELTYPES:
+                  default:
+                      // not possible.
+                      break;
+              }
+
+              //
+              // optimization mode cannot currently skip subsampled channels
+              //
+              if (i.channel().xSampling!=1 || i.channel().ySampling!=1)
+              {
+                  optimizationPossible = false;
               }
               ++i;
 	}
@@ -1485,6 +1552,10 @@ ScanLineInputFile::setFrameBuffer (const FrameBuffer &frameBuffer)
                       break;
                   case OPENEXR_IMF_INTERNAL_NAMESPACE::UINT :
                       offset+=2;
+                      break;
+                  case OPENEXR_IMF_INTERNAL_NAMESPACE::NUM_PIXELTYPES:
+                  default:
+                      // not possible.
                       break;
               }
           }
@@ -1655,7 +1726,7 @@ ScanLineInputFile::readPixels (int scanLine1, int scanLine2)
     catch (IEX_NAMESPACE::BaseExc &e)
     {
 	REPLACE_EXC (e, "Error reading pixel data from image "
-		        "file \"" << fileName() << "\". " << e);
+                 "file \"" << fileName() << "\". " << e.what());
 	throw;
     }
 }
@@ -1694,9 +1765,43 @@ ScanLineInputFile::rawPixelData (int firstScanLine,
     catch (IEX_NAMESPACE::BaseExc &e)
     {
 	REPLACE_EXC (e, "Error reading pixel data from image "
-		        "file \"" << fileName() << "\". " << e);
+                 "file \"" << fileName() << "\". " << e.what());
 	throw;
     }
 }
+
+
+void ScanLineInputFile::rawPixelDataToBuffer(int scanLine,
+                                             char *pixelData,
+                                             int &pixelDataSize) const
+{
+  if (_data->memoryMapped) {
+    throw IEX_NAMESPACE::ArgExc ("Reading raw pixel data to a buffer "
+                                 "is not supported for memory mapped "
+                                 "streams." );
+  }
+
+  try 
+  {
+    Lock lock (*_streamData);
+    
+    if (scanLine < _data->minY || scanLine > _data->maxY) 
+    {
+      throw IEX_NAMESPACE::ArgExc ("Tried to read scan line outside "
+                                   "the image file's data window.");
+    }
+    
+    readPixelData
+      (_streamData, _data, scanLine, pixelData, pixelDataSize);
+    
+  }
+  catch (IEX_NAMESPACE::BaseExc &e) 
+  {
+    REPLACE_EXC (e, "Error reading pixel data from image "
+                 "file \"" << fileName() << "\". " << e.what());
+    throw;
+  }
+}
+
 
 OPENEXR_IMF_INTERNAL_NAMESPACE_SOURCE_EXIT

@@ -878,6 +878,7 @@ static int OJPEGDecodeRaw(TIFF *tif, uint8_t *buf, tmsize_t cc)
 {
     static const char module[] = "OJPEGDecodeRaw";
     OJPEGState *sp = (OJPEGState *)tif->tif_data;
+    sp->subsampling_convert_state = 0;
     uint8_t *m;
     tmsize_t n;
     uint8_t *oy;

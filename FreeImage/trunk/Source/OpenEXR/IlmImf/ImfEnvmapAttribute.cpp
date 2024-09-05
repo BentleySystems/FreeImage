@@ -57,6 +57,12 @@ EnvmapAttribute::staticTypeName ()
 template <>
 void
 EnvmapAttribute::writeValueTo (OPENEXR_IMF_INTERNAL_NAMESPACE::OStream &os, int version) const
+#if defined (__clang__)
+    // _value may be an invalid value, which the clang sanitizer reports
+    // as undefined behavior, even though the value is acceptable in this
+    // context.
+    __attribute__((no_sanitize ("undefined")))
+#endif
 {
     unsigned char tmp = _value;
     Xdr::write <StreamIO> (os, tmp);
@@ -72,5 +78,18 @@ EnvmapAttribute::readValueFrom (OPENEXR_IMF_INTERNAL_NAMESPACE::IStream &is, int
     _value = Envmap (tmp);
 }
 
+template <>
+void
+EnvmapAttribute::copyValueFrom (const OPENEXR_IMF_INTERNAL_NAMESPACE::Attribute &other)
+#if defined (__clang__)
+    // _value may be an invalid value, which the clang sanitizer reports
+    // as undefined behavior, even though the value is acceptable in this
+    // context.
+    __attribute__((no_sanitize ("undefined")))
+#endif
+{
+    _value = cast(other).value();
+
+}
 
 OPENEXR_IMF_INTERNAL_NAMESPACE_SOURCE_EXIT 

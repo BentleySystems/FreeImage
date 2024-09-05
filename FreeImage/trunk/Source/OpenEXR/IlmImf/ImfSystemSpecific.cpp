@@ -35,6 +35,7 @@
 #include "ImfSystemSpecific.h"
 #include "ImfNamespace.h"
 #include "OpenEXRConfig.h"
+#include "OpenEXRConfigInternal.h"
 
 OPENEXR_IMF_INTERNAL_NAMESPACE_SOURCE_ENTER
 
@@ -62,7 +63,7 @@ namespace {
 #endif // IMF_HAVE_SSE2 && __GNUC__
 
 
-#ifdef OPENEXR_IMF_HAVE_GCC_INLINE_ASM_AVX
+#ifdef IMF_HAVE_GCC_INLINEASM_X86
 
     void xgetbv(int n, int &eax, int &edx)
     {
@@ -73,14 +74,14 @@ namespace {
             : /* Clobber */);
     }
 
-#else //  OPENEXR_IMF_HAVE_GCC_INLINE_ASM_AVX
+#else //  IMF_HAVE_GCC_INLINEASM_X86
 
     void xgetbv(int n, int &eax, int &edx)
     {
         eax = edx = 0;
     }
 
-#endif //  OPENEXR_IMF_HAVE_GCC_INLINE_ASM_AVX
+#endif //  IMF_HAVE_GCC_INLINEASM_X86
 
 } // namespace 
 

@@ -65,12 +65,11 @@
 
 #include "Iex.h"
 
+#include <algorithm>
+#include <assert.h>
 #include <string>
 #include <vector>
-#include <assert.h>
 #include <limits>
-#include <algorithm>
-
 
 #include "ImfNamespace.h"
 OPENEXR_IMF_INTERNAL_NAMESPACE_SOURCE_ENTER
@@ -80,7 +79,6 @@ using IMATH_NAMESPACE::divp;
 using IMATH_NAMESPACE::modp;
 using std::string;
 using std::vector;
-using std::ifstream;
 using std::min;
 using std::max;
 using ILMTHREAD_NAMESPACE::Mutex;
@@ -262,6 +260,11 @@ struct DeepScanLineInputFile::Data: public Mutex
     Data (int numThreads);
     ~Data ();
 
+    Data (const Data& data) = delete;
+    Data& operator = (const Data& data) = delete;
+    Data (Data&& data) = delete;
+    Data& operator = (Data&& data) = delete;
+    
     inline LineBuffer * getLineBuffer (int number); // hash function from line
                                                     // buffer indices into our
                                                     // vector of line buffers
@@ -348,7 +351,7 @@ reconstructLineOffsets (OPENEXR_IMF_INTERNAL_NAMESPACE::IStream &is,
                 lineOffsets[lineOffsets.size() - i - 1] = lineOffset;
         }
     }
-    catch (...)
+    catch (...) //NOSONAR - suppress vulnerability reports from SonarCloud.
     {
         //
         // Suppress all exceptions.  This functions is
@@ -717,10 +720,12 @@ LineBufferTask::execute ()
 
                     int width = (_ifd->maxX - _ifd->minX + 1);
 
+                    ptrdiff_t base = reinterpret_cast<ptrdiff_t>(&_ifd->sampleCount[0][0]);
+                    base -= sizeof(unsigned int)*_ifd->minX;
+                    base -= sizeof(unsigned int)*static_cast<ptrdiff_t>(_ifd->minY) * static_cast<ptrdiff_t>(width);
+
                     copyIntoDeepFrameBuffer (readPtr, slice.base,
-                                             (char*) (&_ifd->sampleCount[0][0]
-                                                      - _ifd->minX
-                                                      - _ifd->minY * width),
+                                             reinterpret_cast<char*>(base),
                                              sizeof(unsigned int) * 1,
                                              sizeof(unsigned int) * width,
                                              y, _ifd->minX, _ifd->maxX,
@@ -915,8 +920,7 @@ void DeepScanLineInputFile::initialize(const Header& header)
     }
     catch (...)
     {
-        delete _data;
-        _data=NULL;
+        // Don't delete _data here, leave that to caller
         throw;
     }
 }
@@ -932,8 +936,15 @@ DeepScanLineInputFile::DeepScanLineInputFile(InputPartData* part)
     _data->memoryMapped = _data->_streamData->is->isMemoryMapped();
     _data->version = part->version;
 
-    initialize(part->header);
-
+    try
+    {
+       initialize(part->header);
+    }
+    catch(...)
+    {
+        delete _data;
+        throw;
+    }
     _data->lineOffsets = part->chunkOffsets;
 
     _data->partNumber = part->partNumber;
@@ -945,7 +956,6 @@ DeepScanLineInputFile::DeepScanLineInputFile
 :
      _data (new Data (numThreads))
 {
-    _data->_streamData = new InputStreamMutex();
     _data->_deleteStream = true;
     OPENEXR_IMF_INTERNAL_NAMESPACE::IStream* is = 0;
 
@@ -955,12 +965,29 @@ DeepScanLineInputFile::DeepScanLineInputFile
         readMagicNumberAndVersionField(*is, _data->version);
         //
         // Backward compatibility to read multpart file.
-        //
+        // multiPartInitialize will create _streamData
         if (isMultiPart(_data->version))
         {
             compatibilityInitialize(*is);
             return;
         }
+    }
+    catch (IEX_NAMESPACE::BaseExc &e)
+    {
+        if (is)          delete is;
+        if (_data)       delete _data;
+
+        REPLACE_EXC (e, "Cannot read image file "
+                     "\"" << fileName << "\". " << e.what());
+        throw;
+    }
+
+    // 
+    // not multiPart - allocate stream data and intialise as normal
+    //
+    try
+    { 
+        _data->_streamData = new InputStreamMutex();
         _data->_streamData->is = is;
         _data->memoryMapped = is->isMemoryMapped();
         _data->header.readFrom (*_data->_streamData->is, _data->version);
@@ -976,17 +1003,23 @@ DeepScanLineInputFile::DeepScanLineInputFile
     catch (IEX_NAMESPACE::BaseExc &e)
     {
         if (is)          delete is;
-        if (_data && _data->_streamData) delete _data->_streamData;
+        if (_data && _data->_streamData)
+        {
+            delete _data->_streamData;
+        }
         if (_data)       delete _data;
 
         REPLACE_EXC (e, "Cannot read image file "
-                        "\"" << fileName << "\". " << e);
+                     "\"" << fileName << "\". " << e.what());
         throw;
     }
     catch (...)
     {
         if (is)          delete is;
-        if (_data && _data->_streamData) delete _data->_streamData;
+        if (_data && _data->_streamData)
+        {
+            delete _data->_streamData;
+        }
         if (_data)       delete _data;
 
         throw;
@@ -1010,7 +1043,20 @@ DeepScanLineInputFile::DeepScanLineInputFile
 
     _data->version =version;
     
-    initialize (header);
+    try
+    {
+        initialize (header);
+    }
+    catch (...)
+    {
+        if (_data && _data->_streamData)
+        {
+            delete _data->_streamData;
+        }
+        if (_data)       delete _data;
+
+        throw;
+   }
 
     readLineOffsets (*_data->_streamData->is,
                      _data->lineOrder,
@@ -1042,8 +1088,9 @@ DeepScanLineInputFile::~DeepScanLineInputFile ()
         //
 
         if (_data->partNumber == -1 && _data->_streamData)
+        {
             delete _data->_streamData;
-
+        }
         delete _data;
     }
 }
@@ -1366,7 +1413,7 @@ DeepScanLineInputFile::readPixels (int scanLine1, int scanLine2)
     catch (IEX_NAMESPACE::BaseExc &e)
     {
         REPLACE_EXC (e, "Error reading pixel data from image "
-                        "file \"" << fileName() << "\". " << e);
+                     "file \"" << fileName() << "\". " << e.what());
         throw;
     }
 }
@@ -1800,7 +1847,7 @@ readSampleCountForLineBlock(InputStreamMutex* streamData,
 
     
     
-    if(sampleCountTableDataSize>data->maxSampleCountTableSize)
+    if(sampleCountTableDataSize>static_cast<Int64>(data->maxSampleCountTableSize))
     {
         THROW (IEX_NAMESPACE::ArgExc, "Bad sampleCountTableDataSize read from chunk "<< lineBlockId << ": expected " << data->maxSampleCountTableSize << " or less, got "<< sampleCountTableDataSize);
     }
@@ -1839,7 +1886,7 @@ readSampleCountForLineBlock(InputStreamMutex* streamData,
     //
 
 
-    if (sampleCountTableDataSize < data->maxSampleCountTableSize)
+    if (sampleCountTableDataSize < static_cast<Int64>(data->maxSampleCountTableSize))
     {
         if(!data->sampleCountTableComp)
         {
@@ -1994,7 +2041,7 @@ DeepScanLineInputFile::readPixelSampleCounts (int scanline1, int scanline2)
     catch (IEX_NAMESPACE::BaseExc &e)
     {
         REPLACE_EXC (e, "Error reading sample count data from image "
-                        "file \"" << fileName() << "\". " << e);
+                     "file \"" << fileName() << "\". " << e.what());
 
         _data->_streamData->is->seekg(savedFilePos);
 

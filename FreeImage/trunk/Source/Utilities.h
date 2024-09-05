@@ -353,7 +353,8 @@ AssignPixel(BYTE* dst, const BYTE* src, unsigned bytesperpixel) {
 			break;
 			
 		default:
-			assert(FALSE);
+			//assert(FALSE);
+			throw "Invalid bytesperpixel"; //CVE-2023-47997
 	}
 }
 

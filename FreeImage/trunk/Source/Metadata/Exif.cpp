@@ -770,6 +770,13 @@ jpeg_read_exif_dir(FIBITMAP *dib, const BYTE *tiffp, DWORD dwOffsetIfd0, DWORD d
 	//
 
 	const WORD entriesCount0th = ReadUint16(msb_order, ifd0th);
+		
+	//CVE-2023-47993
+	if (DIR_ENTRY_ADDR(ifd0th, entriesCount0th) - tiffp > (size_t)dwLength)
+	{
+		// suspicious offset, fail
+		throw "Invalid entriesCount0th";
+	}
 	
 	DWORD next_offset = ReadUint32(msb_order, DIR_ENTRY_ADDR(ifd0th, entriesCount0th));
 	if((next_offset == 0) || (next_offset >= dwLength)) {
@@ -832,8 +839,9 @@ jpeg_read_exif_dir(FIBITMAP *dib, const BYTE *tiffp, DWORD dwOffsetIfd0, DWORD d
 		return TRUE;
 	}
 	
-	if(thOffset + thSize > dwLength) {
-		return TRUE;
+	//CVE-2023-47996, avoid int32 overflow
+	if((size_t)thOffset + (size_t)thSize > (size_t)dwLength) {
+		throw "Invalid thOffset or thSize";
 	}
 	
 	// load the thumbnail

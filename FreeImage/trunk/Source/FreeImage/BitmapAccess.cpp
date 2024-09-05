@@ -387,6 +387,13 @@ FreeImage_AllocateBitmap(BOOL header_only, BYTE *ext_bits, unsigned ext_pitch, F
 			return NULL;
 		}
 
+		//Should not be larger than 4GB //CVE-2023-47995
+		if (dib_size * sizeof(BYTE) >= INT_MAX)
+		{
+			free(bitmap);
+			return NULL;
+		}
+
 		bitmap->data = (BYTE *)FreeImage_Aligned_Malloc(dib_size * sizeof(BYTE), FIBITMAP_ALIGNMENT);
 
 		if (bitmap->data != NULL) {

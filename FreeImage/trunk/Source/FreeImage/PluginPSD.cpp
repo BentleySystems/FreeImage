@@ -108,38 +108,12 @@ SupportsNoPixels() {
 
 static FIBITMAP * DLL_CALLCONV
 Load(FreeImageIO *io, fi_handle handle, int page, int flags, void *data) {
-	if(!handle) {
-		return NULL;
-	}
-	try {
-		psdParser parser;
-
-		FIBITMAP *dib = parser.Load(io, handle, s_format_id, flags);
-		
-		return dib;
-
-	} catch(const char *text) {
-		FreeImage_OutputMessageProc(s_format_id, text);
-		return NULL;
-	}
+	return NULL; //Disable PSD support
 }
 
 static BOOL DLL_CALLCONV
 Save(FreeImageIO *io, FIBITMAP *dib, fi_handle handle, int page, int flags, void *data) {
-	if(!handle) {
-		return FALSE;
-	}
-	try {
-		psdParser parser;
-
-		bool b = parser.Save(io, dib, handle, page, flags, data);
-		
-		return b;
-
-	} catch(const char *text) {
-		FreeImage_OutputMessageProc(s_format_id, text);
-		return FALSE;
-	}
+	return FALSE;
 }
 
 // ==========================================================

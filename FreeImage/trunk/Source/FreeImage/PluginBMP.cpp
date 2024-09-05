@@ -158,7 +158,7 @@ CheckBitmapInfoHeader(BITMAPINFOHEADER *bih) {
 			return FALSE;
 		}
 	}
-	if (bih->biWidth < 0) {
+	if (bih->biWidth < 0) { //CVE-2023-47992
 		return FALSE;
 	}
 	if (bih->biHeight < 0) {
@@ -604,6 +604,7 @@ LoadWindowsBMP(FreeImageIO *io, fi_handle handle, int flags, unsigned bitmap_bit
 						break;
 
 					case BI_RLE4 :
+						//CVE-2023-47994
 						if( (bit_count == 4) && LoadPixelDataRLE4(io, handle, width, height, dib) ) {
 							return dib;
 						} else {

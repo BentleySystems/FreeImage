@@ -118,6 +118,11 @@ struct MultiPartInputFile::Data: public InputStreamMutex
             delete parts[i];
     }
     
+    Data (const Data& other) = delete;
+    Data& operator = (const Data& other) = delete;
+    Data (Data&& other) = delete;
+    Data& operator = (Data&& other) = delete;
+    
     template <class T>
     T*    createInputPartT(int partNumber)
     {
@@ -140,7 +145,7 @@ MultiPartInputFile::MultiPartInputFile(const char fileName[],
         delete _data;
 
         REPLACE_EXC (e, "Cannot read image file "
-                        "\"" << fileName << "\". " << e);
+                     "\"" << fileName << "\". " << e.what());
         throw;
     }
     catch (...)
@@ -165,7 +170,7 @@ MultiPartInputFile::MultiPartInputFile (OPENEXR_IMF_INTERNAL_NAMESPACE::IStream&
         delete _data;
 
         REPLACE_EXC (e, "Cannot read image file "
-                        "\"" << is.fileName() << "\". " << e);
+                     "\"" << is.fileName() << "\". " << e.what());
         throw;
     }
     catch (...)
@@ -335,6 +340,11 @@ MultiPartInputFile::initialize()
     // Perform usual check on headers.
     //
 
+    if ( _data->_headers.size() == 0)
+    {
+        throw IEX_NAMESPACE::ArgExc ("Files must contain at least one header");
+    }
+
     for (size_t i = 0; i < _data->_headers.size(); i++)
     {
         //
@@ -446,25 +456,37 @@ MultiPartInputFile::Data::createTileOffsets(const Header& header)
     // Precompute level and tile information
     //
 
-    int* numXTiles;
-    int* numYTiles;
+    int* numXTiles = nullptr;
+    int* numYTiles = nullptr;
     int numXLevels, numYLevels;
     TileDescription tileDesc = header.tileDescription();
-    precalculateTileInfo (tileDesc,
-                          minX, maxX,
-                          minY, maxY,
-                          numXTiles, numYTiles,
-                          numXLevels, numYLevels);
+    try
+    {
 
-    TileOffsets* tileOffsets = new TileOffsets (tileDesc.mode,
-                                                numXLevels,
-                                                numYLevels,
-                                                numXTiles,
-                                                numYTiles);
-    delete [] numXTiles;
-    delete [] numYTiles;
+        precalculateTileInfo (tileDesc,
+                            minX, maxX,
+                            minY, maxY,
+                            numXTiles, numYTiles,
+                            numXLevels, numYLevels);
 
-    return tileOffsets;
+        TileOffsets* tileOffsets = new TileOffsets (tileDesc.mode,
+                                                    numXLevels,
+                                                    numYLevels,
+                                                    numXTiles,
+                                                    numYTiles);
+        delete [] numXTiles;
+        delete [] numYTiles;
+
+        return tileOffsets;
+
+    }
+    catch(...)
+    {
+        delete [] numXTiles;
+        delete [] numYTiles;
+        throw;
+    }
+
 }
 
 
@@ -511,7 +533,7 @@ MultiPartInputFile::Data::chunkOffsetReconstruction(OPENEXR_IMF_INTERNAL_NAMESPA
     
     vector<TileOffsets*> tileOffsets(parts.size());
     
-    // for scanline-based parts, number of scanlines in each part
+    // for scanline-based parts, number of scanlines in each chunk
     vector<int> rowsizes(parts.size());
         
     for(size_t i = 0 ; i < parts.size() ; i++)
@@ -571,10 +593,9 @@ MultiPartInputFile::Data::chunkOffsetReconstruction(OPENEXR_IMF_INTERNAL_NAMESPA
             
             
             
-            if(partNumber<0 || partNumber>int(parts.size()))
+            if(partNumber<0 || partNumber>= static_cast<int>(parts.size()))
             {
-                // bail here - bad part number
-                throw int();
+                throw IEX_NAMESPACE::IoExc("part number out of range");
             }
             
             Header& header = parts[partNumber]->header;
@@ -601,14 +622,13 @@ MultiPartInputFile::Data::chunkOffsetReconstruction(OPENEXR_IMF_INTERNAL_NAMESPA
                 {
                     // this shouldn't actually happen - we should have allocated a valid
                     // tileOffsets for any part which isTiled
-                    throw int();
+                    throw IEX_NAMESPACE::IoExc("part not tiled");
                     
                 }
                 
                 if(!tileOffsets[partNumber]->isValidTile(tilex,tiley,levelx,levely))
                 {
-                    //std::cout << "invalid tile : aborting\n";
-                    throw int();
+                    throw IEX_NAMESPACE::IoExc("invalid tile coordinates");
                 }
                 
                 (*tileOffsets[partNumber])(tilex,tiley,levelx,levely)=chunk_start;
@@ -623,7 +643,7 @@ MultiPartInputFile::Data::chunkOffsetReconstruction(OPENEXR_IMF_INTERNAL_NAMESPA
                     OPENEXR_IMF_INTERNAL_NAMESPACE::Xdr::read <OPENEXR_IMF_INTERNAL_NAMESPACE::StreamIO> (is, packed_sample);
                     
                     //add 40 byte header to packed sizes (tile coordinates, packed sizes, unpacked size)
-                    size_of_chunk=packed_offset+packed_sample+40;
+                    size_of_chunk=packed_offset+packed_sample + 40ll;
                 }
                 else
                 {
@@ -631,7 +651,7 @@ MultiPartInputFile::Data::chunkOffsetReconstruction(OPENEXR_IMF_INTERNAL_NAMESPA
                     // regular image has 20 bytes of header, 4 byte chunksize;
                     int chunksize;
                     OPENEXR_IMF_INTERNAL_NAMESPACE::Xdr::read <OPENEXR_IMF_INTERNAL_NAMESPACE::StreamIO> (is, chunksize);
-                    size_of_chunk=chunksize+20;
+                    size_of_chunk=static_cast<Int64>(chunksize) + 20ll;
                 }
             }
             else
@@ -639,18 +659,20 @@ MultiPartInputFile::Data::chunkOffsetReconstruction(OPENEXR_IMF_INTERNAL_NAMESPA
                 int y_coordinate;
                 OPENEXR_IMF_INTERNAL_NAMESPACE::Xdr::read <OPENEXR_IMF_INTERNAL_NAMESPACE::StreamIO> (is, y_coordinate);
                 
+                
+                if(y_coordinate < header.dataWindow().min.y || y_coordinate > header.dataWindow().max.y)
+                {
+                   throw IEX_NAMESPACE::IoExc("y out of range");
+                }
                 y_coordinate -= header.dataWindow().min.y;
                 y_coordinate /= rowsizes[partNumber];   
                 
                 if(y_coordinate < 0 || y_coordinate >= int(parts[partNumber]->chunkOffsets.size()))
                 {
-                    //std::cout << "aborting reconstruction: bad data " << y_coordinate << endl;
-                    //bail to exception catcher: broken scanline
-                    throw int();
+                   throw IEX_NAMESPACE::IoExc("chunk index out of range");
                 }
                 
                 parts[partNumber]->chunkOffsets[y_coordinate]=chunk_start;
-                //std::cout << "chunk_start for " << y_coordinate << ':' << chunk_start << std::endl;
                 
                 if(header.type()==DEEPSCANLINE)
                 {
@@ -660,13 +682,13 @@ MultiPartInputFile::Data::chunkOffsetReconstruction(OPENEXR_IMF_INTERNAL_NAMESPA
                     OPENEXR_IMF_INTERNAL_NAMESPACE::Xdr::read <OPENEXR_IMF_INTERNAL_NAMESPACE::StreamIO> (is, packed_sample);
                     
                     
-                    size_of_chunk=packed_offset+packed_sample+28;
+                    size_of_chunk=packed_offset+packed_sample + 28ll;
                 }
                 else
                 {
                     int chunksize;
                     OPENEXR_IMF_INTERNAL_NAMESPACE::Xdr::read <OPENEXR_IMF_INTERNAL_NAMESPACE::StreamIO> (is, chunksize);   
-                    size_of_chunk=chunksize+8;
+                    size_of_chunk=static_cast<Int64>(chunksize) + 8ll;
                 }
                 
             }
@@ -678,14 +700,12 @@ MultiPartInputFile::Data::chunkOffsetReconstruction(OPENEXR_IMF_INTERNAL_NAMESPA
             
             chunk_start+=size_of_chunk;
             
-            //std::cout << " next chunk +"<<size_of_chunk << " = " << chunk_start << std::endl;
-            
             is.seekg(chunk_start);
             
         }
         
     }
-    catch (...)
+    catch (...) //NOSONAR - suppress vulnerability reports from SonarCloud.
     {
         //
         // Suppress all exceptions.  This functions is
@@ -735,7 +755,7 @@ MultiPartInputFile::Data::readChunkOffsetTables(bool reconstructChunkOffsetTable
 
     for (size_t i = 0; i < parts.size(); i++)
     {
-        int chunkOffsetTableSize = getChunkOffsetTableSize(parts[i]->header,false);
+        int chunkOffsetTableSize = getChunkOffsetTableSize(parts[i]->header);
         parts[i]->chunkOffsets.resize(chunkOffsetTableSize);
 
         for (int j = 0; j < chunkOffsetTableSize; j++)

@@ -64,6 +64,8 @@
 #include <vector>
 #include <algorithm>
 #include <assert.h>
+#include <string>
+#include <vector>
 #include <limits>
 
 #include "ImfNamespace.h"
@@ -266,6 +268,11 @@ struct DeepTiledInputFile::Data: public Mutex
      Data (int numThreads);
     ~Data ();
 
+    Data (const Data& other) = delete;
+    Data& operator = (const Data& other) = delete;
+    Data (Data&& other) = delete;
+    Data& operator = (Data&& other) = delete;
+    
     inline TileBuffer * getTileBuffer (int number);
                                                     // hash function from tile indices
                                                     // into our vector of tile buffers
@@ -283,7 +290,8 @@ DeepTiledInputFile::Data::Data (int numThreads):
     multiPartBackwardSupport(false),
     numThreads(numThreads),
     memoryMapped(false),
-    _streamData(NULL),
+    sampleCountTableComp(nullptr),
+    _streamData(nullptr),
     _deleteStream(false)
 {
     //
@@ -308,6 +316,8 @@ DeepTiledInputFile::Data::~Data ()
 
     for (size_t i = 0; i < slices.size(); i++)
         delete slices[i];
+
+    delete sampleCountTableComp;
 }
 
 
@@ -458,59 +468,6 @@ readTileData (InputStreamMutex *streamData,
 }
 
 
-void
-readNextTileData (InputStreamMutex *streamData,
-                  DeepTiledInputFile::Data *ifd,
-                  int &dx, int &dy,
-                  int &lx, int &ly,
-                  char * & buffer,
-                  Int64 &dataSize,
-                  Int64 &unpackedDataSize)
-{
-    //
-    // Read the next tile block from the file
-    //
-
-    //
-    // Read the first few bytes of the tile (the header).
-    //
-
-    Xdr::read <StreamIO> (*streamData->is, dx);
-    Xdr::read <StreamIO> (*streamData->is, dy);
-    Xdr::read <StreamIO> (*streamData->is, lx);
-    Xdr::read <StreamIO> (*streamData->is, ly);
-
-    Int64 tableSize;
-    Xdr::read <StreamIO> (*streamData->is, tableSize);
-
-    Xdr::read <StreamIO> (*streamData->is, dataSize);
-    Xdr::read <StreamIO> (*streamData->is, unpackedDataSize);
-
-    //
-    // Skip the pixel sample count table because we have read this data.
-    //
-
-    Xdr::skip <StreamIO> (*streamData->is, tableSize);
-
-    //
-    // Read the pixel data.
-    //
-
-    streamData->is->read (buffer, dataSize);
-
-    //
-    // Keep track of which tile is the next one in
-    // the file, so that we can avoid redundant seekg()
-    // operations (seekg() can be fairly expensive).
-    //
-
-    streamData->currentPosition += 4 * Xdr::size<int>()   +
-                                   3 * Xdr::size<Int64>() +
-                                   tableSize              +
-                                   dataSize;
-}
-
-
 //
 // A TileBufferTask encapsulates the task of uncompressing
 // a single tile and copying it into the frame buffer.
@@ -600,8 +557,12 @@ TileBufferTask::execute ()
                 int count = _ifd->getSampleCount(x - xOffset, y - yOffset);
                 for (unsigned int c = 0; c < _ifd->slices.size(); ++c)
                 {
-                    sizeOfTile += count * pixelTypeSize(_ifd->slices[c]->typeInFile);
-                    bytesPerLine += count * pixelTypeSize(_ifd->slices[c]->typeInFile);
+                    // This slice does not exist in the file.
+                    if ( !_ifd->slices[c]->fill)
+                    {
+                          sizeOfTile += count * pixelTypeSize(_ifd->slices[c]->typeInFile);
+                          bytesPerLine += count * pixelTypeSize(_ifd->slices[c]->typeInFile);     
+                    }
                 }
                 numPixelsPerScanLine[y - tileRange.min.y] += count;
             }
@@ -623,7 +584,7 @@ TileBufferTask::execute ()
         // Uncompress the data, if necessary
         //
 
-        if (_tileBuffer->compressor && _tileBuffer->dataSize < Int64(sizeOfTile))
+        if (_tileBuffer->compressor && _tileBuffer->dataSize < static_cast<Int64>(sizeOfTile))
         {
             _tileBuffer->format = _tileBuffer->compressor->format();
 
@@ -641,6 +602,15 @@ TileBufferTask::execute ()
             _tileBuffer->format = Compressor::XDR;
             _tileBuffer->uncompressedData = _tileBuffer->buffer;
         }
+
+	//
+	// sanity check data size: the uncompressed data should be exactly 
+	// 'sizeOfTile' (if it's less, the file is corrupt and there'll be a buffer overrun)
+	//
+        if (_tileBuffer->dataSize != static_cast<Int64>(sizeOfTile))
+	{
+		THROW (IEX_NAMESPACE::InputExc, "size mismatch when reading deep tile: expected " << sizeOfTile << "bytes of uncompressed data but got " << _tileBuffer->dataSize);
+	}
 
         //
         // Convert the tile of pixel data back from the machine-independent
@@ -829,7 +799,7 @@ DeepTiledInputFile::DeepTiledInputFile (const char fileName[], int numThreads):
         if (_data)       delete _data;
 
         REPLACE_EXC (e, "Cannot open image file "
-                        "\"" << fileName << "\". " << e);
+                     "\"" << fileName << "\". " << e.what());
         throw;
     }
     catch (...)
@@ -883,7 +853,7 @@ DeepTiledInputFile::DeepTiledInputFile (OPENEXR_IMF_INTERNAL_NAMESPACE::IStream 
         if (_data)       delete _data;
 
         REPLACE_EXC (e, "Cannot open image file "
-                        "\"" << is.fileName() << "\". " << e);
+                     "\"" << is.fileName() << "\". " << e.what());
         throw;
     }
     catch (...)
@@ -927,7 +897,15 @@ DeepTiledInputFile::DeepTiledInputFile (InputPartData* part) :
     _data (new Data (part->numThreads))
 {
     _data->_deleteStream=false;
-    multiPartInitialize(part);
+    try
+    {
+       multiPartInitialize(part);
+    }
+    catch(...)
+    {
+        delete _data;
+        throw;
+    }
 }
 
 
@@ -1014,8 +992,8 @@ DeepTiledInputFile::initialize ()
     for (size_t i = 0; i < _data->tileBuffers.size(); i++)
         _data->tileBuffers[i] = new TileBuffer ();
 
-    _data->maxSampleCountTableSize = _data->tileDesc.ySize *
-                                     _data->tileDesc.xSize *
+    _data->maxSampleCountTableSize = static_cast<size_t>(_data->tileDesc.ySize) *
+                                     static_cast<size_t>(_data->tileDesc.xSize) *
                                      sizeof(int);
 
     _data->sampleCountTableBuffer.resizeErase(_data->maxSampleCountTableSize);
@@ -1363,7 +1341,7 @@ DeepTiledInputFile::readTiles (int dx1, int dx2, int dy1, int dy2, int lx, int l
     catch (IEX_NAMESPACE::BaseExc &e)
     {
         REPLACE_EXC (e, "Error reading pixel data from image "
-                        "file \"" << fileName() << "\". " << e);
+                     "file \"" << fileName() << "\". " << e.what());
         throw;
     }
 }
@@ -1588,7 +1566,7 @@ DeepTiledInputFile::levelWidth (int lx) const
     catch (IEX_NAMESPACE::BaseExc &e)
     {
         REPLACE_EXC (e, "Error calling levelWidth() on image "
-                        "file \"" << fileName() << "\". " << e);
+                     "file \"" << fileName() << "\". " << e.what());
         throw;
     }
 }
@@ -1605,7 +1583,7 @@ DeepTiledInputFile::levelHeight (int ly) const
     catch (IEX_NAMESPACE::BaseExc &e)
     {
         REPLACE_EXC (e, "Error calling levelHeight() on image "
-                        "file \"" << fileName() << "\". " << e);
+                     "file \"" << fileName() << "\". " << e.what());
         throw;
     }
 }
@@ -1661,7 +1639,7 @@ DeepTiledInputFile::dataWindowForLevel (int lx, int ly) const
     catch (IEX_NAMESPACE::BaseExc &e)
     {
         REPLACE_EXC (e, "Error calling dataWindowForLevel() on image "
-                        "file \"" << fileName() << "\". " << e);
+                     "file \"" << fileName() << "\". " << e.what());
         throw;
     }
 }
@@ -1691,7 +1669,7 @@ DeepTiledInputFile::dataWindowForTile (int dx, int dy, int lx, int ly) const
     catch (IEX_NAMESPACE::BaseExc &e)
     {
         REPLACE_EXC (e, "Error calling dataWindowForTile() on image "
-                        "file \"" << fileName() << "\". " << e);
+                     "file \"" << fileName() << "\". " << e.what());
         throw;
     }
 }
@@ -1824,7 +1802,7 @@ DeepTiledInputFile::readPixelSampleCounts (int dx1, int dx2,
                 // @TODO refactor the compressor code to ensure full 64-bit support.
                 //
 
-                Int64 compressorMaxDataSize = Int64(std::numeric_limits<int>::max());
+                Int64 compressorMaxDataSize = static_cast<Int64>(std::numeric_limits<int>::max());
                 if (dataSize         > compressorMaxDataSize ||
                     unpackedDataSize > compressorMaxDataSize ||
                     tableSize        > compressorMaxDataSize)
@@ -1900,7 +1878,7 @@ DeepTiledInputFile::readPixelSampleCounts (int dx1, int dx2,
     catch (IEX_NAMESPACE::BaseExc &e)
     {
         REPLACE_EXC (e, "Error reading sample count data from image "
-                        "file \"" << fileName() << "\". " << e);
+                     "file \"" << fileName() << "\". " << e.what());
 
          _data->_streamData->is->seekg(savedFilePos);
 
@@ -1957,7 +1935,7 @@ DeepTiledInputFile::totalTiles() const
                 for (int i_lx = 0; i_lx < numXLevels (); ++i_lx)
                     numAllTiles += numXTiles (i_lx) * numYTiles (i_ly);
                 
-                break;
+            break;
             
         default:
             

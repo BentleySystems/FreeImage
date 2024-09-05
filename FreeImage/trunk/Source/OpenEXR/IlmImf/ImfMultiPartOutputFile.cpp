@@ -124,6 +124,12 @@ struct MultiPartOutputFile::Data: public OutputStreamMutex
             for (size_t i = 0; i < parts.size(); i++)
                 delete parts[i];
         }
+
+    Data (const Data& other) = delete;
+    Data& operator = (const Data& other) = delete;
+    Data (Data&& other) = delete;
+    Data& operator = (Data&& other) = delete;
+    
 };
 
 void
@@ -145,7 +151,7 @@ MultiPartOutputFile::Data::do_header_sanity_checks(bool overrideSharedAttributes
     if (isMultiPart)
     {
         // multipart files must contain a chunkCount attribute
-        _headers[0].setChunkCount(getChunkOffsetTableSize(_headers[0],true));
+        _headers[0].setChunkCount(getChunkOffsetTableSize(_headers[0]));
         
         for (size_t i = 1; i < parts; i++)
         {
@@ -153,7 +159,7 @@ MultiPartOutputFile::Data::do_header_sanity_checks(bool overrideSharedAttributes
                 throw IEX_NAMESPACE::ArgExc ("Every header in a multipart file should have a type");
             
             
-            _headers[i].setChunkCount(getChunkOffsetTableSize(_headers[i],true));
+            _headers[i].setChunkCount(getChunkOffsetTableSize(_headers[i]));
             _headers[i].sanityCheck (_headers[i].hasTileDescription(), isMultiPart);
             
             
@@ -185,7 +191,7 @@ MultiPartOutputFile::Data::do_header_sanity_checks(bool overrideSharedAttributes
         
         if (_headers[0].hasType() && isImage(_headers[0].type()) == false)
         {
-            _headers[0].setChunkCount(getChunkOffsetTableSize(_headers[0],true));
+            _headers[0].setChunkCount(getChunkOffsetTableSize(_headers[0]));
         }
         
     }
@@ -229,7 +235,7 @@ MultiPartOutputFile::MultiPartOutputFile (const char fileName[],
         delete _data;
 
         REPLACE_EXC (e, "Cannot open image file "
-                        "\"" << fileName << "\". " << e);
+                     "\"" << fileName << "\". " << e.what());
         throw;
     }
     catch (...)
@@ -275,7 +281,7 @@ MultiPartOutputFile::MultiPartOutputFile(OStream& os,
         delete _data;
         
         REPLACE_EXC (e, "Cannot open image stream "
-        "\"" << os.fileName() << "\". " << e);
+                     "\"" << os.fileName() << "\". " << e.what());
         throw;
     }
     catch (...)
@@ -494,11 +500,11 @@ MultiPartOutputFile::Data::writeChunkTableOffsets (vector<OutputPartData*> &part
 {
     for (size_t i = 0; i < parts.size(); i++)
     {
-        int chunkTableSize = getChunkOffsetTableSize(parts[i]->header,false);
+        int chunkTableSize = getChunkOffsetTableSize(parts[i]->header);
 
         Int64 pos = os->tellp();
 
-        if (pos == -1)
+        if (pos == static_cast<Int64>(-1))
             IEX_NAMESPACE::throwErrnoExc ("Cannot determine current file position (%T).");
 
         parts[i]->chunkOffsetTablePosition = os->tellp();

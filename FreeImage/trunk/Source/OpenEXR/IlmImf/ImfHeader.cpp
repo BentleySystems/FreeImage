@@ -73,7 +73,8 @@
 #include <sstream>
 #include <stdlib.h>
 #include <time.h>
-
+#include <cmath>
+#include "ImfTiledMisc.h"
 #include "ImfNamespace.h"
 
 OPENEXR_IMF_INTERNAL_NAMESPACE_SOURCE_ENTER
@@ -106,6 +107,8 @@ initialize (Header &header,
 {
     header.insert ("displayWindow", Box2iAttribute (displayWindow));
     header.insert ("dataWindow", Box2iAttribute (dataWindow));
+    if ( !std::isnormal (pixelAspectRatio) || pixelAspectRatio < 0.f)
+        THROW (IEX_NAMESPACE::ArgExc, "Invalid pixel aspect ratio");
     header.insert ("pixelAspectRatio", FloatAttribute (pixelAspectRatio));
     header.insert ("screenWindowCenter", V2fAttribute (screenWindowCenter));
     header.insert ("screenWindowWidth", FloatAttribute (screenWindowWidth));
@@ -127,6 +130,19 @@ void checkIsNullTerminated (const char (&str)[N], const char *what)
 	throw IEX_NAMESPACE::InputExc(s);
 }
 
+void
+sanityCheckDisplayWindow (int width, int height)
+{
+    //
+    // Ensure a valid displayWindow.  All values for which width-1 < 0
+    // are invalid, but in particular, note that if width=-INT_MAX,
+    // width-1 will overflow.
+    //
+    
+    if (width < 1 || height < 1)
+	throw IEX_NAMESPACE::ArgExc ("Invalid display window in image header.");
+}
+
 } // namespace
 
 
@@ -140,6 +156,8 @@ Header::Header (int width,
 :
     _map()
 {
+    sanityCheckDisplayWindow (width, height);
+
     staticInitialize();
 
     Box2i displayWindow (V2i (0, 0), V2i (width - 1, height - 1));
@@ -166,6 +184,8 @@ Header::Header (int width,
 :
     _map()
 {
+    sanityCheckDisplayWindow (width, height);
+
     staticInitialize();
 
     Box2i displayWindow (V2i (0, 0), V2i (width - 1, height - 1));
@@ -785,30 +805,30 @@ Header::sanityCheck (bool isTiled, bool isMultipartFile) const
 	throw IEX_NAMESPACE::ArgExc ("Invalid data window in image header.");
     }
 
-    if (maxImageWidth > 0 &&
-        maxImageWidth < (dataWindow.max.x - dataWindow.min.x + 1))
+    int w = (dataWindow.max.x - dataWindow.min.x + 1);
+    if (maxImageWidth > 0 && maxImageWidth < w)
     {
 	THROW (IEX_NAMESPACE::ArgExc, "The width of the data window exceeds the "
 			    "maximum width of " << maxImageWidth << "pixels.");
     }
 
-    if (maxImageHeight > 0 &&
-	maxImageHeight < dataWindow.max.y - dataWindow.min.y + 1)
+    int h = (dataWindow.max.y - dataWindow.min.y + 1);
+    if (maxImageHeight > 0 && maxImageHeight < h)
     {
-	THROW (IEX_NAMESPACE::ArgExc, "The width of the data window exceeds the "
-			    "maximum width of " << maxImageHeight << "pixels.");
+	THROW (IEX_NAMESPACE::ArgExc, "The height of the data window exceeds the "
+			    "maximum height of " << maxImageHeight << "pixels.");
     }
 
-   // chunk table must be smaller than the maximum image area
-   // (only reachable for unknown types or damaged files: will have thrown earlier
-   //  for regular image types)
-   if( maxImageHeight>0 && maxImageWidth>0 && 
-       hasChunkCount() && chunkCount()>Int64(maxImageWidth)*Int64(maxImageHeight))
-   {
-       THROW (IEX_NAMESPACE::ArgExc, "chunkCount exceeds maximum area of "
-       << Int64(maxImageWidth)*Int64(maxImageHeight) << " pixels." );
+    // chunk table must be smaller than the maximum image area
+    // (only reachable for unknown types or damaged files: will have thrown earlier
+    //  for regular image types)
+    if( maxImageHeight>0 && maxImageWidth>0 && 
+	hasChunkCount() && static_cast<Int64>(chunkCount())>Int64(maxImageWidth)*Int64(maxImageHeight))
+    {
+	THROW (IEX_NAMESPACE::ArgExc, "chunkCount exceeds maximum area of "
+	       << Int64(maxImageWidth)*Int64(maxImageHeight) << " pixels." );
        
-   }
+    }
 
 
     //
@@ -827,10 +847,11 @@ Header::sanityCheck (bool isTiled, bool isMultipartFile) const
     const float MIN_PIXEL_ASPECT_RATIO = 1e-6f;
     const float MAX_PIXEL_ASPECT_RATIO = 1e+6f;
 
-    if (pixelAspectRatio < MIN_PIXEL_ASPECT_RATIO ||
-	pixelAspectRatio > MAX_PIXEL_ASPECT_RATIO)
+    if (!std::isnormal(pixelAspectRatio) ||
+        pixelAspectRatio < MIN_PIXEL_ASPECT_RATIO ||
+        pixelAspectRatio > MAX_PIXEL_ASPECT_RATIO)
     {
-	throw IEX_NAMESPACE::ArgExc ("Invalid pixel aspect ratio in image header.");
+        throw IEX_NAMESPACE::ArgExc ("Invalid pixel aspect ratio in image header.");
     }
 
     //
@@ -869,6 +890,7 @@ Header::sanityCheck (bool isTiled, bool isMultipartFile) const
     }
     
     const std::string & part_type=hasType() ? type() : "";
+
     
     if(part_type!="" && !isSupportedType(part_type))
     {
@@ -878,6 +900,7 @@ Header::sanityCheck (bool isTiled, bool isMultipartFile) const
         return;
     }
     
+    bool isDeep = isDeepData(part_type);
    
     //
     // If the file is tiled, verify that the tile description has reasonable
@@ -890,44 +913,49 @@ Header::sanityCheck (bool isTiled, bool isMultipartFile) const
 
     if (isTiled)
     {
-	if (!hasTileDescription())
-	{
-	    throw IEX_NAMESPACE::ArgExc ("Tiled image has no tile "
-			       "description attribute.");
-	}
+        if (!hasTileDescription())
+        {
+            throw IEX_NAMESPACE::ArgExc ("Tiled image has no tile "
+                        "description attribute.");
+        }
 
-	const TileDescription &tileDesc = tileDescription();
+        const TileDescription &tileDesc = tileDescription();
 
-	if (tileDesc.xSize <= 0 || tileDesc.ySize <= 0)
-	    throw IEX_NAMESPACE::ArgExc ("Invalid tile size in image header.");
+        if (tileDesc.xSize <= 0 || tileDesc.ySize <= 0 || tileDesc.xSize > INT_MAX || tileDesc.ySize > INT_MAX )
+            throw IEX_NAMESPACE::ArgExc ("Invalid tile size in image header.");
 
-	if (maxTileWidth > 0 &&
-	    maxTileWidth < int(tileDesc.xSize))
-	{
-	    THROW (IEX_NAMESPACE::ArgExc, "The width of the tiles exceeds the maximum "
-				"width of " << maxTileWidth << "pixels.");
-	}
+        if (maxTileWidth > 0 &&
+            maxTileWidth < int(tileDesc.xSize))
+        {
+            THROW (IEX_NAMESPACE::ArgExc, "The width of the tiles exceeds the maximum "
+                    "width of " << maxTileWidth << "pixels.");
+        }
 
-	if (maxTileHeight > 0 &&
-	    maxTileHeight < int(tileDesc.ySize))
-	{
-	    THROW (IEX_NAMESPACE::ArgExc, "The width of the tiles exceeds the maximum "
-				"width of " << maxTileHeight << "pixels.");
-	}
+        if (maxTileHeight > 0 &&
+            maxTileHeight < int(tileDesc.ySize))
+        {
+            THROW (IEX_NAMESPACE::ArgExc, "The width of the tiles exceeds the maximum "
+                    "width of " << maxTileHeight << "pixels.");
+        }
 
-	if (tileDesc.mode != ONE_LEVEL &&
-	    tileDesc.mode != MIPMAP_LEVELS &&
-	    tileDesc.mode != RIPMAP_LEVELS)
-	    throw IEX_NAMESPACE::ArgExc ("Invalid level mode in image header.");
+        if (tileDesc.mode != ONE_LEVEL &&
+            tileDesc.mode != MIPMAP_LEVELS &&
+            tileDesc.mode != RIPMAP_LEVELS)
+            throw IEX_NAMESPACE::ArgExc ("Invalid level mode in image header.");
 
-	if (tileDesc.roundingMode != ROUND_UP &&
-	    tileDesc.roundingMode != ROUND_DOWN)
-	    throw IEX_NAMESPACE::ArgExc ("Invalid level rounding mode in image header.");
+        if (tileDesc.roundingMode != ROUND_UP &&
+            tileDesc.roundingMode != ROUND_DOWN)
+            throw IEX_NAMESPACE::ArgExc ("Invalid level rounding mode in image header.");
 
-	if (lineOrder != INCREASING_Y &&
-	    lineOrder != DECREASING_Y &&
-	    lineOrder != RANDOM_Y)
-	    throw IEX_NAMESPACE::ArgExc ("Invalid line order in image header.");
+        if (lineOrder != INCREASING_Y &&
+            lineOrder != DECREASING_Y &&
+            lineOrder != RANDOM_Y)
+            throw IEX_NAMESPACE::ArgExc ("Invalid line order in image header.");
+
+        // computes size of chunk offset table. Throws an exception if this exceeds
+        // the maximum allowable size
+        getTiledChunkOffsetTableSize(*this);
+
     }
     else
     {
@@ -945,7 +973,8 @@ Header::sanityCheck (bool isTiled, bool isMultipartFile) const
     if (!isValidCompression (this->compression()))
   	throw IEX_NAMESPACE::ArgExc ("Unknown compression type in image header.");
     
-    if(isDeepData(part_type))
+    
+    if( isDeep )
     {
         if (!isValidDeepCompression (this->compression()))
             throw IEX_NAMESPACE::ArgExc ("Compression type in header not valid for deep data");
@@ -957,6 +986,8 @@ Header::sanityCheck (bool isTiled, bool isMultipartFile) const
     // If the file is tiled then for each channel, the type must be one of the
     // predefined values, and the x and y sampling must both be 1.
     //
+    // x and y sampling must currently also be 1 for deep scanline images
+    //
     // If the file is not tiled then for each channel, the type must be one
     // of the predefined values, the x and y coordinates of the data window's
     // upper left corner must be divisible by the x and y subsampling factors,
@@ -966,7 +997,7 @@ Header::sanityCheck (bool isTiled, bool isMultipartFile) const
 
     const ChannelList &channels = this->channels();
     
-    if (isTiled)
+    if (isTiled || isDeep)
     {
 	for (ChannelList::ConstIterator i = channels.begin();
 	     i != channels.end();
@@ -1180,6 +1211,11 @@ Header::readFrom (OPENEXR_IMF_INTERNAL_NAMESPACE::IStream &is, int &version)
 	OPENEXR_IMF_INTERNAL_NAMESPACE::Xdr::read <OPENEXR_IMF_INTERNAL_NAMESPACE::StreamIO> (is, Name::MAX_LENGTH, typeName);
 	checkIsNullTerminated (typeName, "attribute type name");
 	OPENEXR_IMF_INTERNAL_NAMESPACE::Xdr::read <OPENEXR_IMF_INTERNAL_NAMESPACE::StreamIO> (is, size);
+
+    if( size < 0 )
+    {
+        throw IEX_NAMESPACE::InputExc("Invalid size field in header attribute");
+    }
 
 	AttributeMap::iterator i = _map.find (name);
 

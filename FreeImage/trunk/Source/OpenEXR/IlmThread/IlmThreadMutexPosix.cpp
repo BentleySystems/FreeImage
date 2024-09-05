@@ -40,12 +40,12 @@
 //-----------------------------------------------------------------------------
 
 #include "IlmBaseConfig.h"
-
-#if HAVE_PTHREAD
-
 #include "IlmThreadMutex.h"
-#include "Iex.h"
-#include <assert.h>
+
+#ifdef ILMBASE_FORCE_CXX03
+#   ifdef HAVE_PTHREAD
+#      include "Iex.h"
+#      include <assert.h>
 
 ILMTHREAD_INTERNAL_NAMESPACE_SOURCE_ENTER
 
@@ -82,4 +82,5 @@ Mutex::unlock () const
 
 ILMTHREAD_INTERNAL_NAMESPACE_SOURCE_EXIT
 
+#   endif
 #endif

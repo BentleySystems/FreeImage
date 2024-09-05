@@ -71,9 +71,6 @@ typedef struct
     uint8_t *uncompressed_buffer;
     unsigned int uncompressed_offset;
 
-    uint8_t *uncompressed_buffer_multiband;
-    unsigned int uncompressed_buffer_multiband_alloc;
-
     unsigned int mask_size;
     uint8_t *mask_buffer;
 
@@ -171,7 +168,7 @@ static int GetLercDataType(TIFF *tif)
     return -1;
 }
 
-static int SetupBuffers(TIFF *tif, LERCState *sp, const char *module)
+static int SetupUncompressedBuffer(TIFF *tif, LERCState *sp, const char *module)
 {
     TIFFDirectory *td = &tif->tif_dir;
     uint64_t new_size_64;
@@ -205,9 +202,8 @@ static int SetupBuffers(TIFF *tif, LERCState *sp, const char *module)
     sp->uncompressed_size = new_size;
 
     /* add some margin as we are going to use it also to store deflate/zstd
-     * compressed data. We also need extra margin when writing very small
-     * rasters with one mask per band. */
-    new_alloc_64 = 256 + new_size_64 + new_size_64 / 3;
+     * compressed data */
+    new_alloc_64 = 100 + new_size_64 + new_size_64 / 3;
 #ifdef ZSTD_SUPPORT
     {
         size_t zstd_max = ZSTD_compressBound((size_t)new_size_64);
@@ -247,17 +243,11 @@ static int SetupBuffers(TIFF *tif, LERCState *sp, const char *module)
          td->td_sampleinfo[td->td_extrasamples - 1] == EXTRASAMPLE_UNASSALPHA &&
          GetLercDataType(tif) == 1) ||
         (td->td_sampleformat == SAMPLEFORMAT_IEEEFP &&
+         (td->td_planarconfig == PLANARCONFIG_SEPARATE ||
+          td->td_samplesperpixel == 1) &&
          (td->td_bitspersample == 32 || td->td_bitspersample == 64)))
     {
         unsigned int mask_size = sp->segment_width * sp->segment_height;
-#if LERC_AT_LEAST_VERSION(3, 0, 0)
-        if (td->td_sampleformat == SAMPLEFORMAT_IEEEFP &&
-            td->td_planarconfig == PLANARCONFIG_CONTIG)
-        {
-            /* We may need one mask per band */
-            mask_size *= td->td_samplesperpixel;
-        }
-#endif
         if (sp->mask_size < mask_size)
         {
             void *mask_buffer =
@@ -289,7 +279,7 @@ static int LERCPreDecode(TIFF *tif, uint16_t s)
     TIFFDirectory *td = &tif->tif_dir;
     LERCState *sp = LERCDecoderState(tif);
     int lerc_data_type;
-    unsigned int infoArray[9];
+    unsigned int infoArray[8];
     unsigned nomask_bands = td->td_samplesperpixel;
     int ndims;
     int use_mask = 0;
@@ -305,7 +295,7 @@ static int LERCPreDecode(TIFF *tif, uint16_t s)
     if (lerc_data_type < 0)
         return 0;
 
-    if (!SetupBuffers(tif, sp, module))
+    if (!SetupUncompressedBuffer(tif, sp, module))
         return 0;
 
     if (sp->additional_compression != LERC_ADD_COMPRESSION_NONE)
@@ -410,7 +400,7 @@ static int LERCPreDecode(TIFF *tif, uint16_t s)
     }
 
     lerc_ret =
-        lerc_getBlobInfo(lerc_data, lerc_data_size, infoArray, NULL, 9, 0);
+        lerc_getBlobInfo(lerc_data, lerc_data_size, infoArray, NULL, 8, 0);
     if (lerc_ret != 0)
     {
         TIFFErrorExtR(tif, module, "lerc_getBlobInfo() failed");
@@ -428,16 +418,18 @@ static int LERCPreDecode(TIFF *tif, uint16_t s)
         use_mask = 1;
         nomask_bands--;
     }
-    else if (td->td_sampleformat == SAMPLEFORMAT_IEEEFP)
+    else if (td->td_sampleformat == SAMPLEFORMAT_IEEEFP &&
+             (td->td_planarconfig == PLANARCONFIG_SEPARATE ||
+              td->td_samplesperpixel == 1) &&
+             (td->td_bitspersample == 32 || td->td_bitspersample == 64))
     {
         use_mask = 1;
     }
 
     ndims = td->td_planarconfig == PLANARCONFIG_CONTIG ? nomask_bands : 1;
 
-    /* Info returned in infoArray is { version, dataType, nDim/nDepth, nCols,
-        nRows, nBands, nValidPixels, blobSize,
-        and starting with liblerc 3.0 nRequestedMasks } */
+    /* Info returned in infoArray is { version, dataType, nDim, nCols,
+        nRows, nBands, nValidPixels, blobSize } */
     if (infoArray[0] != (unsigned)sp->lerc_version)
     {
         TIFFWarningExtR(tif, module,
@@ -450,29 +442,12 @@ static int LERCPreDecode(TIFF *tif, uint16_t s)
                       infoArray[1], lerc_data_type);
         return 0;
     }
-
-    const unsigned nFoundDims = infoArray[2];
-#if LERC_AT_LEAST_VERSION(3, 0, 0)
-    if (td->td_sampleformat == SAMPLEFORMAT_IEEEFP &&
-        td->td_planarconfig == PLANARCONFIG_CONTIG &&
-        td->td_samplesperpixel > 1)
-    {
-        if (nFoundDims != 1 && nFoundDims != (unsigned)ndims)
-        {
-            TIFFErrorExtR(tif, module, "Unexpected nDim: %d. Expected: 1 or %d",
-                          nFoundDims, ndims);
-            return 0;
-        }
-    }
-    else
-#endif
-        if (nFoundDims != (unsigned)ndims)
+    if (infoArray[2] != (unsigned)ndims)
     {
         TIFFErrorExtR(tif, module, "Unexpected nDim: %d. Expected: %d",
-                      nFoundDims, ndims);
+                      infoArray[2], ndims);
         return 0;
     }
-
     if (infoArray[3] != sp->segment_width)
     {
         TIFFErrorExtR(tif, module, "Unexpected nCols: %d. Expected: %du",
@@ -485,38 +460,12 @@ static int LERCPreDecode(TIFF *tif, uint16_t s)
                       infoArray[4], sp->segment_height);
         return 0;
     }
-
-    const unsigned nFoundBands = infoArray[5];
-    if (td->td_sampleformat == SAMPLEFORMAT_IEEEFP &&
-        td->td_planarconfig == PLANARCONFIG_CONTIG &&
-        td->td_samplesperpixel > 1 && nFoundDims == 1)
-    {
-#if !LERC_AT_LEAST_VERSION(3, 0, 0)
-        if (nFoundBands == td->td_samplesperpixel)
-        {
-            TIFFErrorExtR(
-                tif, module,
-                "Unexpected nBands: %d. This file may have been generated with "
-                "a liblerc version >= 3.0, with one mask per band, and is not "
-                "supported by this older version of liblerc",
-                nFoundBands);
-            return 0;
-        }
-#endif
-        if (nFoundBands != td->td_samplesperpixel)
-        {
-            TIFFErrorExtR(tif, module, "Unexpected nBands: %d. Expected: %d",
-                          nFoundBands, td->td_samplesperpixel);
-            return 0;
-        }
-    }
-    else if (nFoundBands != 1)
+    if (infoArray[5] != 1)
     {
         TIFFErrorExtR(tif, module, "Unexpected nBands: %d. Expected: %d",
-                      nFoundBands, 1);
+                      infoArray[5], 1);
         return 0;
     }
-
     if (infoArray[7] != lerc_data_size)
     {
         TIFFErrorExtR(tif, module, "Unexpected blobSize: %d. Expected: %u",
@@ -524,75 +473,13 @@ static int LERCPreDecode(TIFF *tif, uint16_t s)
         return 0;
     }
 
-    int nRequestedMasks = use_mask ? 1 : 0;
+    lerc_ret = lerc_decode(lerc_data, lerc_data_size,
 #if LERC_AT_LEAST_VERSION(3, 0, 0)
-    const int nFoundMasks = infoArray[8];
-    if (td->td_sampleformat == SAMPLEFORMAT_IEEEFP &&
-        td->td_planarconfig == PLANARCONFIG_CONTIG &&
-        td->td_samplesperpixel > 1 && nFoundDims == 1)
-    {
-        if (nFoundMasks != 0 && nFoundMasks != td->td_samplesperpixel)
-        {
-            TIFFErrorExtR(tif, module,
-                          "Unexpected nFoundMasks: %d. Expected: 0 or %d",
-                          nFoundMasks, td->td_samplesperpixel);
-            return 0;
-        }
-        nRequestedMasks = nFoundMasks;
-    }
-    else
-    {
-        if (nFoundMasks != 0 && nFoundMasks != 1)
-        {
-            TIFFErrorExtR(tif, module,
-                          "Unexpected nFoundMasks: %d. Expected: 0 or 1",
-                          nFoundMasks);
-            return 0;
-        }
-    }
-    if (td->td_sampleformat == SAMPLEFORMAT_IEEEFP && nFoundMasks == 0)
-    {
-        nRequestedMasks = 0;
-        use_mask = 0;
-    }
+                           use_mask ? 1 : 0,
 #endif
-
-    const unsigned nb_pixels = sp->segment_width * sp->segment_height;
-
-#if LERC_AT_LEAST_VERSION(3, 0, 0)
-    if (nRequestedMasks > 1)
-    {
-        unsigned int num_bytes_needed =
-            nb_pixels * td->td_samplesperpixel * (td->td_bitspersample / 8);
-        if (sp->uncompressed_buffer_multiband_alloc < num_bytes_needed)
-        {
-            _TIFFfreeExt(tif, sp->uncompressed_buffer_multiband);
-            sp->uncompressed_buffer_multiband =
-                _TIFFmallocExt(tif, num_bytes_needed);
-            if (!sp->uncompressed_buffer_multiband)
-            {
-                sp->uncompressed_buffer_multiband_alloc = 0;
-                return 0;
-            }
-            sp->uncompressed_buffer_multiband_alloc = num_bytes_needed;
-        }
-        lerc_ret = lerc_decode(lerc_data, lerc_data_size, nRequestedMasks,
-                               sp->mask_buffer, nFoundDims, sp->segment_width,
-                               sp->segment_height, nFoundBands, lerc_data_type,
-                               sp->uncompressed_buffer_multiband);
-    }
-    else
-#endif
-    {
-        lerc_ret =
-            lerc_decode(lerc_data, lerc_data_size,
-#if LERC_AT_LEAST_VERSION(3, 0, 0)
-                        nRequestedMasks,
-#endif
-                        use_mask ? sp->mask_buffer : NULL, nFoundDims,
-                        sp->segment_width, sp->segment_height, nFoundBands,
-                        lerc_data_type, sp->uncompressed_buffer);
-    }
+                           use_mask ? sp->mask_buffer : NULL, ndims,
+                           sp->segment_width, sp->segment_height, 1,
+                           lerc_data_type, sp->uncompressed_buffer);
     if (lerc_ret != 0)
     {
         TIFFErrorExtR(tif, module, "lerc_decode() failed");
@@ -628,6 +515,7 @@ static int LERCPreDecode(TIFF *tif, uint16_t s)
     }
     else if (use_mask && td->td_sampleformat == SAMPLEFORMAT_IEEEFP)
     {
+        const unsigned nb_pixels = sp->segment_width * sp->segment_height;
         unsigned i;
 #if WORDS_BIGENDIAN
         const unsigned char nan_bytes[] = {0x7f, 0xc0, 0, 0};
@@ -637,104 +525,23 @@ static int LERCPreDecode(TIFF *tif, uint16_t s)
         float nan_float32;
         memcpy(&nan_float32, nan_bytes, 4);
 
-        if (td->td_planarconfig == PLANARCONFIG_SEPARATE ||
-            td->td_samplesperpixel == 1)
+        if (td->td_bitspersample == 32)
         {
-            if (td->td_bitspersample == 32)
+            for (i = 0; i < nb_pixels; i++)
             {
-                for (i = 0; i < nb_pixels; i++)
-                {
-                    if (sp->mask_buffer[i] == 0)
-                        ((float *)sp->uncompressed_buffer)[i] = nan_float32;
-                }
-            }
-            else
-            {
-                const double nan_float64 = nan_float32;
-                for (i = 0; i < nb_pixels; i++)
-                {
-                    if (sp->mask_buffer[i] == 0)
-                        ((double *)sp->uncompressed_buffer)[i] = nan_float64;
-                }
+                if (sp->mask_buffer[i] == 0)
+                    ((float *)sp->uncompressed_buffer)[i] = nan_float32;
             }
         }
-        else if (nRequestedMasks == 1)
-        {
-            assert(nFoundDims == td->td_samplesperpixel);
-            assert(nFoundBands == 1);
-
-            unsigned k = 0;
-            if (td->td_bitspersample == 32)
-            {
-                for (i = 0; i < nb_pixels; i++)
-                {
-                    for (int j = 0; j < td->td_samplesperpixel; j++)
-                    {
-                        if (sp->mask_buffer[i] == 0)
-                            ((float *)sp->uncompressed_buffer)[k] = nan_float32;
-                        ++k;
-                    }
-                }
-            }
-            else
-            {
-                const double nan_float64 = nan_float32;
-                for (i = 0; i < nb_pixels; i++)
-                {
-                    for (int j = 0; j < td->td_samplesperpixel; j++)
-                    {
-                        if (sp->mask_buffer[i] == 0)
-                            ((double *)sp->uncompressed_buffer)[k] =
-                                nan_float64;
-                        ++k;
-                    }
-                }
-            }
-        }
-#if LERC_AT_LEAST_VERSION(3, 0, 0)
         else
         {
-            assert(nRequestedMasks == td->td_samplesperpixel);
-            assert(nFoundDims == 1);
-            assert(nFoundBands == td->td_samplesperpixel);
-
-            unsigned k = 0;
-            if (td->td_bitspersample == 32)
+            const double nan_float64 = nan_float32;
+            for (i = 0; i < nb_pixels; i++)
             {
-                for (i = 0; i < nb_pixels; i++)
-                {
-                    for (int j = 0; j < td->td_samplesperpixel; j++)
-                    {
-                        if (sp->mask_buffer[i + j * nb_pixels] == 0)
-                            ((float *)sp->uncompressed_buffer)[k] = nan_float32;
-                        else
-                            ((float *)sp->uncompressed_buffer)[k] =
-                                ((float *)sp->uncompressed_buffer_multiband)
-                                    [i + j * nb_pixels];
-                        ++k;
-                    }
-                }
-            }
-            else
-            {
-                const double nan_float64 = nan_float32;
-                for (i = 0; i < nb_pixels; i++)
-                {
-                    for (int j = 0; j < td->td_samplesperpixel; j++)
-                    {
-                        if (sp->mask_buffer[i + j * nb_pixels] == 0)
-                            ((double *)sp->uncompressed_buffer)[k] =
-                                nan_float64;
-                        else
-                            ((double *)sp->uncompressed_buffer)[k] =
-                                ((double *)sp->uncompressed_buffer_multiband)
-                                    [i + j * nb_pixels];
-                        ++k;
-                    }
-                }
+                if (sp->mask_buffer[i] == 0)
+                    ((double *)sp->uncompressed_buffer)[i] = nan_float64;
             }
         }
-#endif
     }
 
     return 1;
@@ -804,7 +611,7 @@ static int LERCPreEncode(TIFF *tif, uint16_t s)
     if (lerc_data_type < 0)
         return 0;
 
-    if (!SetupBuffers(tif, sp, module))
+    if (!SetupUncompressedBuffer(tif, sp, module))
         return 0;
 
     return 1;
@@ -843,6 +650,7 @@ static int LERCPostEncode(TIFF *tif)
     lerc_status lerc_ret;
     static const char module[] = "LERCPostEncode";
     LERCState *sp = LERCEncoderState(tif);
+    unsigned int numBytes = 0;
     unsigned int numBytesWritten = 0;
     TIFFDirectory *td = &tif->tif_dir;
     int use_mask = 0;
@@ -853,9 +661,6 @@ static int LERCPostEncode(TIFF *tif)
         TIFFErrorExtR(tif, module, "Unexpected number of bytes in the buffer");
         return 0;
     }
-
-    int mask_count = 1;
-    const unsigned nb_pixels = sp->segment_width * sp->segment_height;
 
     /* Extract alpha mask (if containing only 0 and 255 values, */
     /* and compact array of regular bands */
@@ -868,6 +673,7 @@ static int LERCPostEncode(TIFF *tif)
         const unsigned src_stride =
             td->td_samplesperpixel * (td->td_bitspersample / 8);
         unsigned i = 0;
+        const unsigned nb_pixels = sp->segment_width * sp->segment_height;
 
         use_mask = 1;
         for (i = 0; i < nb_pixels; i++)
@@ -904,78 +710,46 @@ static int LERCPostEncode(TIFF *tif)
         }
     }
     else if (td->td_sampleformat == SAMPLEFORMAT_IEEEFP &&
+             (td->td_planarconfig == PLANARCONFIG_SEPARATE ||
+              dst_nbands == 1) &&
              (td->td_bitspersample == 32 || td->td_bitspersample == 64))
     {
         /* Check for NaN values */
         unsigned i;
+        const unsigned nb_pixels = sp->segment_width * sp->segment_height;
         if (td->td_bitspersample == 32)
         {
-            if (td->td_planarconfig == PLANARCONFIG_CONTIG && dst_nbands > 1)
+            for (i = 0; i < nb_pixels; i++)
             {
-                unsigned k = 0;
-                for (i = 0; i < nb_pixels; i++)
+                const float val = ((float *)sp->uncompressed_buffer)[i];
+                if (val != val)
                 {
-                    int count_nan = 0;
-                    for (int j = 0; j < td->td_samplesperpixel; ++j)
-                    {
-                        const float val = ((float *)sp->uncompressed_buffer)[k];
-                        ++k;
-                        if (val != val)
-                        {
-                            ++count_nan;
-                        }
-                    }
-                    if (count_nan > 0)
-                    {
-                        use_mask = 1;
-                        if (count_nan < td->td_samplesperpixel)
-                        {
-                            mask_count = td->td_samplesperpixel;
-                            break;
-                        }
-                    }
-                }
-            }
-            else
-            {
-                for (i = 0; i < nb_pixels; i++)
-                {
-                    const float val = ((float *)sp->uncompressed_buffer)[i];
-                    if (val != val)
-                    {
-                        use_mask = 1;
-                        break;
-                    }
+                    use_mask = 1;
+                    break;
                 }
             }
         }
         else
         {
-            if (td->td_planarconfig == PLANARCONFIG_CONTIG && dst_nbands > 1)
+            for (i = 0; i < nb_pixels; i++)
             {
-                unsigned k = 0;
+                const double val = ((double *)sp->uncompressed_buffer)[i];
+                if (val != val)
+                {
+                    use_mask = 1;
+                    break;
+                }
+            }
+        }
+
+        if (use_mask)
+        {
+            if (td->td_bitspersample == 32)
+            {
                 for (i = 0; i < nb_pixels; i++)
                 {
-                    int count_nan = 0;
-                    for (int j = 0; j < td->td_samplesperpixel; ++j)
-                    {
-                        const double val =
-                            ((double *)sp->uncompressed_buffer)[k];
-                        ++k;
-                        if (val != val)
-                        {
-                            ++count_nan;
-                        }
-                    }
-                    if (count_nan > 0)
-                    {
-                        use_mask = 1;
-                        if (count_nan < td->td_samplesperpixel)
-                        {
-                            mask_count = td->td_samplesperpixel;
-                            break;
-                        }
-                    }
+                    const float val = ((float *)sp->uncompressed_buffer)[i];
+                    sp->mask_buffer[i] = (val == val) ? 255 : 0;
                 }
             }
             else
@@ -983,168 +757,62 @@ static int LERCPostEncode(TIFF *tif)
                 for (i = 0; i < nb_pixels; i++)
                 {
                     const double val = ((double *)sp->uncompressed_buffer)[i];
-                    if (val != val)
-                    {
-                        use_mask = 1;
-                        break;
-                    }
+                    sp->mask_buffer[i] = (val == val) ? 255 : 0;
                 }
             }
         }
+    }
 
-        if (use_mask)
+#if 0
+        lerc_ret = lerc_computeCompressedSize(
+            sp->uncompressed_buffer,
+            sp->lerc_version,
+            GetLercDataType(tif),
+            td->td_planarconfig == PLANARCONFIG_CONTIG ?
+                dst_nbands : 1,
+            sp->segment_width,
+            sp->segment_height,
+            1,
+            use_mask ? sp->mask_buffer : NULL,
+            sp->maxzerror,
+            &numBytes);
+        if( lerc_ret != 0 )
         {
-            if (mask_count > 1)
-            {
-#if LERC_AT_LEAST_VERSION(3, 0, 0)
-                unsigned int num_bytes_needed =
-                    nb_pixels * dst_nbands * (td->td_bitspersample / 8);
-                if (sp->uncompressed_buffer_multiband_alloc < num_bytes_needed)
-                {
-                    _TIFFfreeExt(tif, sp->uncompressed_buffer_multiband);
-                    sp->uncompressed_buffer_multiband =
-                        _TIFFmallocExt(tif, num_bytes_needed);
-                    if (!sp->uncompressed_buffer_multiband)
-                    {
-                        sp->uncompressed_buffer_multiband_alloc = 0;
-                        return 0;
-                    }
-                    sp->uncompressed_buffer_multiband_alloc = num_bytes_needed;
-                }
-
-                unsigned k = 0;
-                if (td->td_bitspersample == 32)
-                {
-                    for (i = 0; i < nb_pixels; i++)
-                    {
-                        for (int j = 0; j < td->td_samplesperpixel; ++j)
-                        {
-                            const float val =
-                                ((float *)sp->uncompressed_buffer)[k];
-                            ((float *)sp->uncompressed_buffer_multiband)
-                                [i + j * nb_pixels] = val;
-                            ++k;
-                            sp->mask_buffer[i + j * nb_pixels] =
-                                (val == val) ? 255 : 0;
-                        }
-                    }
-                }
-                else
-                {
-                    for (i = 0; i < nb_pixels; i++)
-                    {
-                        for (int j = 0; j < td->td_samplesperpixel; ++j)
-                        {
-                            const double val =
-                                ((double *)sp->uncompressed_buffer)[k];
-                            ((double *)sp->uncompressed_buffer_multiband)
-                                [i + j * nb_pixels] = val;
-                            ++k;
-                            sp->mask_buffer[i + j * nb_pixels] =
-                                (val == val) ? 255 : 0;
-                        }
-                    }
-                }
-#else
-                TIFFErrorExtR(tif, module,
-                              "lerc_encode() would need to create one mask per "
-                              "sample, but this requires liblerc >= 3.0");
-                return 0;
-#endif
-            }
-            else if (td->td_planarconfig == PLANARCONFIG_CONTIG &&
-                     dst_nbands > 1)
-            {
-                if (td->td_bitspersample == 32)
-                {
-                    for (i = 0; i < nb_pixels; i++)
-                    {
-                        const float val =
-                            ((float *)sp->uncompressed_buffer)[i * dst_nbands];
-                        sp->mask_buffer[i] = (val == val) ? 255 : 0;
-                    }
-                }
-                else
-                {
-                    for (i = 0; i < nb_pixels; i++)
-                    {
-                        const double val =
-                            ((double *)sp->uncompressed_buffer)[i * dst_nbands];
-                        sp->mask_buffer[i] = (val == val) ? 255 : 0;
-                    }
-                }
-            }
-            else
-            {
-                if (td->td_bitspersample == 32)
-                {
-                    for (i = 0; i < nb_pixels; i++)
-                    {
-                        const float val = ((float *)sp->uncompressed_buffer)[i];
-                        sp->mask_buffer[i] = (val == val) ? 255 : 0;
-                    }
-                }
-                else
-                {
-                    for (i = 0; i < nb_pixels; i++)
-                    {
-                        const double val =
-                            ((double *)sp->uncompressed_buffer)[i];
-                        sp->mask_buffer[i] = (val == val) ? 255 : 0;
-                    }
-                }
-            }
+            TIFFErrorExtR(tif, module,
+                         "lerc_computeCompressedSize() failed");
+            return 0;
         }
-    }
-
-    unsigned int estimated_compressed_size = sp->uncompressed_alloc;
-#if LERC_AT_LEAST_VERSION(3, 0, 0)
-    if (mask_count > 1)
-    {
-        estimated_compressed_size += nb_pixels * mask_count / 8;
-    }
+#else
+    numBytes = sp->uncompressed_alloc;
 #endif
 
-    if (sp->compressed_size < estimated_compressed_size)
+    if (sp->compressed_size < numBytes)
     {
         _TIFFfreeExt(tif, sp->compressed_buffer);
-        sp->compressed_buffer = _TIFFmallocExt(tif, estimated_compressed_size);
+        sp->compressed_buffer = _TIFFmallocExt(tif, numBytes);
         if (!sp->compressed_buffer)
         {
             sp->compressed_size = 0;
             return 0;
         }
-        sp->compressed_size = estimated_compressed_size;
+        sp->compressed_size = numBytes;
     }
 
+    lerc_ret = lerc_encodeForVersion(
+        sp->uncompressed_buffer, sp->lerc_version, GetLercDataType(tif),
+        td->td_planarconfig == PLANARCONFIG_CONTIG ? dst_nbands : 1,
+        sp->segment_width, sp->segment_height, 1,
 #if LERC_AT_LEAST_VERSION(3, 0, 0)
-    if (mask_count > 1)
-    {
-        lerc_ret = lerc_encodeForVersion(
-            sp->uncompressed_buffer_multiband, sp->lerc_version,
-            GetLercDataType(tif), 1, sp->segment_width, sp->segment_height,
-            dst_nbands, dst_nbands, sp->mask_buffer, sp->maxzerror,
-            sp->compressed_buffer, sp->compressed_size, &numBytesWritten);
-    }
-    else
+        use_mask ? 1 : 0,
 #endif
-    {
-        lerc_ret = lerc_encodeForVersion(
-            sp->uncompressed_buffer, sp->lerc_version, GetLercDataType(tif),
-            td->td_planarconfig == PLANARCONFIG_CONTIG ? dst_nbands : 1,
-            sp->segment_width, sp->segment_height, 1,
-#if LERC_AT_LEAST_VERSION(3, 0, 0)
-            use_mask ? 1 : 0,
-#endif
-            use_mask ? sp->mask_buffer : NULL, sp->maxzerror,
-            sp->compressed_buffer, sp->compressed_size, &numBytesWritten);
-    }
+        use_mask ? sp->mask_buffer : NULL, sp->maxzerror, sp->compressed_buffer,
+        sp->compressed_size, &numBytesWritten);
     if (lerc_ret != 0)
     {
         TIFFErrorExtR(tif, module, "lerc_encode() failed");
         return 0;
     }
-    assert(numBytesWritten < estimated_compressed_size);
+    assert(numBytesWritten < numBytes);
 
     if (sp->additional_compression == LERC_ADD_COMPRESSION_DEFLATE)
     {
@@ -1290,7 +958,6 @@ static void LERCCleanup(TIFF *tif)
     tif->tif_tagmethods.vsetfield = sp->vsetparent;
 
     _TIFFfreeExt(tif, sp->uncompressed_buffer);
-    _TIFFfreeExt(tif, sp->uncompressed_buffer_multiband);
     _TIFFfreeExt(tif, sp->compressed_buffer);
     _TIFFfreeExt(tif, sp->mask_buffer);
 

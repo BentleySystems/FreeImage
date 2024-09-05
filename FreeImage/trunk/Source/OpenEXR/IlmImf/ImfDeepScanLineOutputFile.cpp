@@ -75,7 +75,6 @@ using IMATH_NAMESPACE::divp;
 using IMATH_NAMESPACE::modp;
 using std::string;
 using std::vector;
-using std::ofstream;
 using std::min;
 using std::max;
 using ILMTHREAD_NAMESPACE::Mutex;
@@ -235,6 +234,10 @@ struct DeepScanLineOutputFile::Data
     Data (int numThreads);
     ~Data ();
 
+    Data (const Data& other) = delete;
+    Data& operator = (const Data& other) = delete;
+    Data (Data&& other) = delete;
+    Data& operator = (Data&& other) = delete;
 
     inline LineBuffer *         getLineBuffer (int number);// hash function from line
                                                            // buffer indices into our
@@ -297,7 +300,7 @@ writeLineOffsets (OPENEXR_IMF_INTERNAL_NAMESPACE::OStream &os, const vector<Int6
 {
     Int64 pos = os.tellp();
 
-    if (pos == -1)
+    if (pos == static_cast<Int64>(-1))
         IEX_NAMESPACE::throwErrnoExc ("Cannot determine current file position (%T).");
 
     for (unsigned int i = 0; i < lineOffsets.size(); i++)
@@ -832,19 +835,21 @@ DeepScanLineOutputFile::DeepScanLineOutputFile
                 _data->header.writeTo (*_data->_streamData->os);
         _data->lineOffsetsPosition =
                 writeLineOffsets (*_data->_streamData->os, _data->lineOffsets);
-	_data->multipart=false;// not multipart; only one header
+        _data->multipart=false;// not multipart; only one header
     }
     catch (IEX_NAMESPACE::BaseExc &e)
     {
+        delete _data->_streamData->os;
         delete _data->_streamData;
         delete _data;
 
         REPLACE_EXC (e, "Cannot open image file "
-                        "\"" << fileName << "\". " << e);
+                     "\"" << fileName << "\". " << e.what());
         throw;
     }
     catch (...)
     {
+        delete _data->_streamData->os;
         delete _data->_streamData;
         delete _data;
         throw;
@@ -883,7 +888,7 @@ DeepScanLineOutputFile::DeepScanLineOutputFile
         delete _data;
 
         REPLACE_EXC (e, "Cannot open image file "
-                        "\"" << os.fileName() << "\". " << e);
+                     "\"" << os.fileName() << "\". " << e.what());
         throw;
     }
     catch (...)
@@ -915,7 +920,7 @@ DeepScanLineOutputFile::DeepScanLineOutputFile(const OutputPartData* part)
         delete _data;
 
         REPLACE_EXC (e, "Cannot initialize output part "
-                        "\"" << part->partNumber << "\". " << e);
+                     "\"" << part->partNumber << "\". " << e.what());
         throw;
     }
     catch (...)
@@ -999,7 +1004,7 @@ DeepScanLineOutputFile::~DeepScanLineOutputFile ()
                 //
                 _data->_streamData->os->seekp (originalPosition);
             }
-            catch (...)
+            catch (...) //NOSONAR - suppress vulnerability reports from SonarCloud.
             {
                 //
                 // We cannot safely throw any exceptions from here.
@@ -1386,7 +1391,7 @@ DeepScanLineOutputFile::writePixels (int numScanLines)
     catch (IEX_NAMESPACE::BaseExc &e)
     {
         REPLACE_EXC (e, "Failed to write pixel data to image "
-                        "file \"" << fileName() << "\". " << e);
+                     "file \"" << fileName() << "\". " << e.what());
         throw;
     }
 }
@@ -1543,7 +1548,7 @@ DeepScanLineOutputFile::updatePreviewImage (const PreviewRgba newPixels[])
     catch (IEX_NAMESPACE::BaseExc &e)
     {
         REPLACE_EXC (e, "Cannot update preview image pixels for "
-                        "file \"" << fileName() << "\". " << e);
+                     "file \"" << fileName() << "\". " << e.what());
         throw;
     }
 }

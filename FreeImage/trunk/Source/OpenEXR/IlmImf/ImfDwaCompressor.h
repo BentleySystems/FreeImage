@@ -62,37 +62,51 @@ class DwaCompressor: public Compressor
     };
 
 
+    IMF_EXPORT
     DwaCompressor (const Header &hdr, 
                    int           maxScanLineSize,
                    int           numScanLines,    // ideally is a multiple of 8
                    AcCompression acCompression);
 
+    IMF_EXPORT
     virtual ~DwaCompressor ();
 
+    DwaCompressor (const DwaCompressor& other) = delete;
+    DwaCompressor& operator = (const DwaCompressor& other) = delete;
+    DwaCompressor (DwaCompressor&& other) = delete;
+    DwaCompressor& operator = (DwaCompressor&& other) = delete;
+    
+    IMF_EXPORT
     virtual int numScanLines () const;
 
-    virtual Imf::Compressor::Format format () const;
+    IMF_EXPORT
+    virtual OPENEXR_IMF_NAMESPACE::Compressor::Format format () const;
 
+    IMF_EXPORT
     virtual int compress (const char *inPtr,
                           int         inSize,
                           int         minY,
                           const char *&outPtr);
 
-    virtual int compressTile (const char   *inPtr,
-                              int           inSize,
-                              Imath::Box2i  range,
-                              const char  *&outPtr);
+    IMF_EXPORT
+    virtual int compressTile (const char              *inPtr,
+                              int                     inSize,
+                              IMATH_NAMESPACE::Box2i  range,
+                              const char              *&outPtr);
 
+    IMF_EXPORT
     virtual int uncompress (const char *inPtr,
                             int         inSize,
                             int         minY,
                             const char *&outPtr);
 
-    virtual int uncompressTile (const char  *inPtr,
-                                int          inSize,
-                                Imath::Box2i range,
-                                const char *&outPtr);
+    IMF_EXPORT
+    virtual int uncompressTile (const char             *inPtr,
+                                int                    inSize,
+                                IMATH_NAMESPACE::Box2i range,
+                                const char             *&outPtr);
 
+    IMF_EXPORT
     static void initializeFuncs ();
 
   private:
@@ -155,29 +169,29 @@ class DwaCompressor: public Compressor
     std::vector<CscChannelSet> _cscSets;
     std::vector<Classifier>    _channelRules;
 
-    char             *_packedAcBuffer;
-    size_t            _packedAcBufferSize;
-    char             *_packedDcBuffer;
-    size_t            _packedDcBufferSize;
-    char             *_rleBuffer;
-    size_t            _rleBufferSize;
-    char             *_outBuffer;
-    size_t            _outBufferSize;
-    char             *_planarUncBuffer[NUM_COMPRESSOR_SCHEMES];
-    size_t            _planarUncBufferSize[NUM_COMPRESSOR_SCHEMES];
+    char*             _packedAcBuffer;
+    Int64             _packedAcBufferSize;
+    char*             _packedDcBuffer;
+    Int64             _packedDcBufferSize;
+    char*             _rleBuffer;
+    Int64             _rleBufferSize;
+    char*             _outBuffer;
+    Int64             _outBufferSize;
+    char*             _planarUncBuffer[NUM_COMPRESSOR_SCHEMES];
+    Int64             _planarUncBufferSize[NUM_COMPRESSOR_SCHEMES];
 
     Zip              *_zip;
     float             _dwaCompressionLevel;
 
-    int compress (const char   *inPtr,
-                  int           inSize,
-                  Imath::Box2i  range,
-                  const char  *&outPtr);
+    int compress (const char              *inPtr,
+                  int                     inSize,
+                  IMATH_NAMESPACE::Box2i  range,
+                  const char              *&outPtr);
 
-    int uncompress (const char   *inPtr,
-                    int           inSize,
-                    Imath::Box2i  range,
-                    const char  *&outPtr);
+    int uncompress (const char             *inPtr,
+                    int                    inSize,
+                    IMATH_NAMESPACE::Box2i range,
+                    const char             *&outPtr);
 
     void initializeBuffers (size_t&);
     void initializeDefaultChannelRules ();

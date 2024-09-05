@@ -52,12 +52,14 @@
     #define debug(x)
 #endif
 
-#if defined(HAVE_UCONTEXT_H) && (defined(__x86_64__) || defined(_M_X64) || defined(__i386__) || defined(_M_IX86))
+#if defined(HAVE_UCONTEXT_H) &&                                                \
+    (defined(ILMBASE_HAVE_SIGCONTEXT_CONTROL_REGISTER_SUPPORT) ||              \
+     defined(ILMBASE_HAVE_CONTROL_REGISTER_SUPPORT))
 
-#include <ucontext.h>
-#include <signal.h>
-#include <iostream>
-#include <stdint.h>
+#        include <ucontext.h>
+#        include <signal.h>
+#        include <iostream>
+#        include <stdint.h>
 
 
 IEX_INTERNAL_NAMESPACE_SOURCE_ENTER
@@ -278,10 +280,18 @@ restoreControlRegs (const ucontext_t & ucon, bool clearExceptions)
 inline void
 restoreControlRegs (const ucontext_t & ucon, bool clearExceptions)
 {
+#if defined(__GLIBC__) || defined(__i386__)
     setCw ((ucon.uc_mcontext.fpregs->cw & cwRestoreMask) | cwRestoreVal);
+#else
+    setCw ((ucon.uc_mcontext.fpregs->cwd & cwRestoreMask) | cwRestoreVal);
+#endif
     
     _fpstate * kfp = reinterpret_cast<_fpstate *> (ucon.uc_mcontext.fpregs);
+#if defined(__GLIBC__) || defined(__i386__)
     setMxcsr (kfp->magic == 0 ? kfp->mxcsr : 0, clearExceptions);
+#else
+    setMxcsr (kfp->mxcsr, clearExceptions);
+#endif
 }
 
 #endif

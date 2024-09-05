@@ -45,6 +45,7 @@
 #include <ImfChannelList.h>
 #include <ImfTileDescription.h>
 #include <algorithm>
+#include <limits>
 
 #include "ImfNamespace.h"
 
@@ -97,13 +98,14 @@ dataWindowForTile (const TileDescription &tileDesc,
     V2i tileMin = V2i (minX + dx * tileDesc.xSize,
 		       minY + dy * tileDesc.ySize);
 
-    V2i tileMax = tileMin + V2i (tileDesc.xSize - 1, tileDesc.ySize - 1);
+    int64_t tileMaxX = int64_t(tileMin[0]) + tileDesc.xSize - 1;
+    int64_t tileMaxY = int64_t(tileMin[1]) + tileDesc.ySize - 1;
 
     V2i levelMax = dataWindowForLevel
 		       (tileDesc, minX, maxX, minY, maxY, lx, ly).max;
 
-    tileMax = V2i (std::min (tileMax[0], levelMax[0]),
-		   std::min (tileMax[1], levelMax[1]));
+    V2i tileMax = V2i (std::min (tileMaxX, int64_t(levelMax[0])),
+		   std::min (tileMaxY, int64_t(levelMax[1])));
 
     return Box2i (tileMin, tileMax);
 }
@@ -301,7 +303,9 @@ calculateNumTiles (int *numTiles,
 {
     for (int i = 0; i < numLevels; i++)
     {
-	numTiles[i] = (levelSize (min, max, i, rmode) + size - 1) / size;
+        // use 64 bits to avoid int overflow if size is large.
+        Int64 l = levelSize (min, max, i, rmode);
+        numTiles[i] = (l + size - 1) / size;
     }
 }
 
@@ -348,41 +352,66 @@ getTiledChunkOffsetTableSize(const Header& header)
     // Precompute level and tile information.
     //
 
-    int* numXTiles;
-    int* numYTiles;
+    int* numXTiles=nullptr;
+    int* numYTiles=nullptr;
     int numXLevels;
     int numYLevels;
-    precalculateTileInfo (header.tileDescription(),
-                          dataWindow.min.x, dataWindow.max.x,
-                          dataWindow.min.y, dataWindow.max.y,
-                          numXTiles, numYTiles,
-                          numXLevels, numYLevels);
-
-    //
-    // Calculate lineOffsetSize.
-    //
-    int lineOffsetSize = 0;
-    const TileDescription &desc = header.tileDescription();
-    switch (desc.mode)
+    try
     {
-        case ONE_LEVEL:
-        case MIPMAP_LEVELS:
-            for (int i = 0; i < numXLevels; i++)
-                lineOffsetSize += numXTiles[i] * numYTiles[i];
+        precalculateTileInfo (header.tileDescription(),
+                            dataWindow.min.x, dataWindow.max.x,
+                            dataWindow.min.y, dataWindow.max.y,
+                            numXTiles, numYTiles,
+                            numXLevels, numYLevels);
+
+        //
+        // Calculate lineOffsetSize.
+        //
+        Int64 lineOffsetSize = 0;
+        const TileDescription &desc = header.tileDescription();
+        switch (desc.mode)
+        {
+            case ONE_LEVEL:
+            case MIPMAP_LEVELS:
+                for (int i = 0; i < numXLevels; i++)
+                {
+                    lineOffsetSize += static_cast<Int64>(numXTiles[i]) * static_cast<Int64>(numYTiles[i]);
+                    if ( lineOffsetSize > static_cast<Int64>(std::numeric_limits<int>::max()) )
+                    {
+                        throw IEX_NAMESPACE::LogicExc("Maximum number of tiles exceeded");
+                    }
+                }
             break;
-        case RIPMAP_LEVELS:
-            for (int i = 0; i < numXLevels; i++)
-                for (int j = 0; j < numYLevels; j++)
-                    lineOffsetSize += numXTiles[i] * numYTiles[j];
+            case RIPMAP_LEVELS:
+                for (int i = 0; i < numXLevels; i++)
+                {
+                    for (int j = 0; j < numYLevels; j++)
+                    {
+                        lineOffsetSize += static_cast<Int64>(numXTiles[i]) * static_cast<Int64>(numYTiles[j]);
+                        if ( lineOffsetSize > static_cast<Int64>(std::numeric_limits<int>::max()) )
+                        {
+                            throw IEX_NAMESPACE::LogicExc("Maximum number of tiles exceeded");
+                        }
+                    }
+                }
             break;
-        case NUM_LEVELMODES :
-            throw IEX_NAMESPACE::LogicExc("Bad level mode getting chunk offset table size");
+            case NUM_LEVELMODES :
+                throw IEX_NAMESPACE::LogicExc("Bad level mode getting chunk offset table size");
+        }
+        delete[] numXTiles;
+        delete[] numYTiles;
+
+        return static_cast<int>(lineOffsetSize);
+
+    }
+    catch(...)
+    {
+        delete[] numXTiles;
+        delete[] numYTiles;
+
+        throw;
     }
 
-    delete[] numXTiles;
-    delete[] numYTiles;
-
-    return lineOffsetSize;
 }
 
 

@@ -114,9 +114,9 @@ bytesPerLineTable (const Header &header,
 	 c != channels.end();
 	 ++c)
     {
-	int nBytes = pixelTypeSize (c.channel().type) *
-		     (dataWindow.max.x - dataWindow.min.x + 1) /
-		     c.channel().xSampling;
+	size_t nBytes = size_t(pixelTypeSize (c.channel().type)) *
+		     size_t(dataWindow.max.x - dataWindow.min.x + 1) /
+		     size_t(c.channel().xSampling);
 
 	for (int y = dataWindow.min.y, i = 0; y <= dataWindow.max.y; ++y, ++i)
 	    if (modp (y, c.channel().ySampling) == 0)
@@ -132,25 +132,17 @@ bytesPerLineTable (const Header &header,
     return maxBytesPerLine;
 }
 
-
-const int&
-sampleCount(const char* base, int xStride, int yStride, int x, int y)
+static int
+roundToNextMultiple(int n, int d)
 {
-    const char* ptr = base + y * yStride + x * xStride;
-    int* intPtr = (int*) ptr;
-
-    return *intPtr;
+    return ((n + d - 1) / d) * d;
 }
 
-int&
-sampleCount(char* base, int xStride, int yStride, int x, int y)
+static int
+roundToPrevMultiple(int n, int d)
 {
-    char* ptr = base + y * yStride + x * xStride;
-    int* intPtr = (int*) ptr;
-    
-    return *intPtr;
+    return (n / d) * d;
 }
-
 
 size_t
 bytesPerDeepLineTable (const Header &header,
@@ -167,18 +159,33 @@ bytesPerDeepLineTable (const Header &header,
          c != channels.end();
          ++c)
     {
-        for (int y = minY; y <= maxY; ++y)
-            if (modp (y, c.channel().ySampling) == 0)
+        const int ySampling = abs(c.channel().ySampling);
+        const int xSampling = abs(c.channel().xSampling);
+        const int pixelSize = pixelTypeSize (c.channel().type);
+
+        // Here we transform from the domain over all pixels into the domain
+        // of actual samples.  We want to sample points in [minY, maxY] where
+        // (y % ySampling) == 0.  However, doing this by rejecting samples
+        // requires O(height*width) modulo computations, which were a
+        // significant bottleneck in the previous implementation of this
+        // function.  For the low, low price of 4 divisions per channel, we
+        // can tighten the y & x ranges to the least and greatest roots of the
+        // sampling function and then stride by the sampling rate.
+        const int sampleMinY = roundToNextMultiple(minY, ySampling);
+        const int sampleMaxY = roundToPrevMultiple(maxY, ySampling);
+        const int sampleMinX = roundToNextMultiple(dataWindow.min.x, xSampling);
+        const int sampleMaxX = roundToPrevMultiple(dataWindow.max.x, xSampling);
+
+        for (int y = sampleMinY; y <= sampleMaxY; y+=ySampling)
+        {
+            int nBytes = 0;
+            for (int x = sampleMinX; x <= sampleMaxX; x += xSampling)
             {
-                int nBytes = 0;
-                for (int x = dataWindow.min.x; x <= dataWindow.max.x; x++)
-                {
-                    if (modp (x, c.channel().xSampling) == 0)
-                        nBytes += pixelTypeSize (c.channel().type) *
-                                  sampleCount(base, xStride, yStride, x, y);
-                }
-                bytesPerLine[y - dataWindow.min.y] += nBytes;
+                nBytes += pixelSize *
+                          sampleCount(base, xStride, yStride, x, y);
             }
+            bytesPerLine[y - dataWindow.min.y] += nBytes;
+        }
     }
 
     size_t maxBytesPerLine = 0;
@@ -262,6 +269,7 @@ defaultFormat (Compressor * compressor)
 }
 
 
+//obsolete
 int
 numLinesInBuffer (Compressor * compressor)
 {
@@ -1374,6 +1382,20 @@ skipChannel (const char *& readPtr,
 }
 
 
+namespace
+{
+//
+// helper function to realign floats
+// for architectures that require 32-bit alignment for float reading
+//
+
+struct FBytes { uint8_t b[4]; };
+union bytesOrFloat {
+  FBytes b;
+  float f;
+} ;
+}
+
 void
 convertInPlace (char *& writePtr,
                 const char *& readPtr,
@@ -1404,7 +1426,9 @@ convertInPlace (char *& writePtr,
     
         for (size_t j = 0; j < numPixels; ++j)
         {
-            Xdr::write <CharPtrIO> (writePtr, *(const float *) readPtr);
+            union bytesOrFloat tmp;
+            tmp.b = * reinterpret_cast<const FBytes *>( readPtr );
+            Xdr::write <CharPtrIO> (writePtr, tmp.f);
             readPtr += sizeof(float);
         }
         break;
@@ -1424,6 +1448,8 @@ copyFromFrameBuffer (char *& writePtr,
                      Compressor::Format format,
 		     PixelType type)
 {
+    char * localWritePtr = writePtr;
+    const char * localReadPtr = readPtr;
     //
     // Copy a horizontal row of pixels from a frame
     // buffer to an output file's line or tile buffer.
@@ -1439,29 +1465,29 @@ copyFromFrameBuffer (char *& writePtr,
         {
           case OPENEXR_IMF_INTERNAL_NAMESPACE::UINT:
 
-            while (readPtr <= endPtr)
+            while (localReadPtr <= endPtr)
             {
-                Xdr::write <CharPtrIO> (writePtr,
-                                        *(const unsigned int *) readPtr);
-                readPtr += xStride;
+                Xdr::write <CharPtrIO> (localWritePtr,
+                                        *(const unsigned int *) localReadPtr);
+                localReadPtr += xStride;
             }
             break;
 
           case OPENEXR_IMF_INTERNAL_NAMESPACE::HALF:
 
-            while (readPtr <= endPtr)
+            while (localReadPtr <= endPtr)
             {
-                Xdr::write <CharPtrIO> (writePtr, *(const half *) readPtr);
-                readPtr += xStride;
+                Xdr::write <CharPtrIO> (localWritePtr, *(const half *) localReadPtr);
+                localReadPtr += xStride;
             }
             break;
 
           case OPENEXR_IMF_INTERNAL_NAMESPACE::FLOAT:
 
-            while (readPtr <= endPtr)
+            while (localReadPtr <= endPtr)
             {
-                Xdr::write <CharPtrIO> (writePtr, *(const float *) readPtr);
-                readPtr += xStride;
+                Xdr::write <CharPtrIO> (localWritePtr, *(const float *) localReadPtr);
+                localReadPtr += xStride;
             }
             break;
 
@@ -1480,33 +1506,33 @@ copyFromFrameBuffer (char *& writePtr,
         {
           case OPENEXR_IMF_INTERNAL_NAMESPACE::UINT:
 
-            while (readPtr <= endPtr)
+            while (localReadPtr <= endPtr)
             {
                 for (size_t i = 0; i < sizeof (unsigned int); ++i)
-                    *writePtr++ = readPtr[i];
+                    *localWritePtr++ = localReadPtr[i];
 
-                readPtr += xStride;
+                localReadPtr += xStride;
             }
             break;
 
           case OPENEXR_IMF_INTERNAL_NAMESPACE::HALF:
 
-            while (readPtr <= endPtr)
+            while (localReadPtr <= endPtr)
             {
-                *(half *) writePtr = *(const half *) readPtr;
-                writePtr += sizeof (half);
-                readPtr += xStride;
+                *(half *) localWritePtr = *(const half *) localReadPtr;
+                localWritePtr += sizeof (half);
+                localReadPtr += xStride;
             }
             break;
 
           case OPENEXR_IMF_INTERNAL_NAMESPACE::FLOAT:
 
-            while (readPtr <= endPtr)
+            while (localReadPtr <= endPtr)
             {
                 for (size_t i = 0; i < sizeof (float); ++i)
-                    *writePtr++ = readPtr[i];
+                    *localWritePtr++ = localReadPtr[i];
 
-                readPtr += xStride;
+                localReadPtr += xStride;
             }
             break;
             
@@ -1515,6 +1541,9 @@ copyFromFrameBuffer (char *& writePtr,
             throw IEX_NAMESPACE::ArgExc ("Unknown pixel data type.");
         }
     }
+
+    writePtr = localWritePtr;
+    readPtr = localReadPtr;
 }
 
 void
@@ -1819,25 +1848,48 @@ usesLongNames (const Header &header)
     return false;
 }
 
+namespace
+{
+// for a given compression type, return the number of scanlines
+// compressed into a single chunk
+// TODO add to API and move to ImfCompressor.cpp
+int
+numLinesInBuffer(Compression comp)
+{
+    switch(comp)
+    {
+        case NO_COMPRESSION :
+        case RLE_COMPRESSION:
+        case ZIPS_COMPRESSION:
+            return 1;
+        case ZIP_COMPRESSION:
+            return 16;
+        case PIZ_COMPRESSION:
+            return 32;
+        case PXR24_COMPRESSION:
+            return 16;
+        case B44_COMPRESSION:
+        case B44A_COMPRESSION:
+        case DWAA_COMPRESSION:
+            return 32;
+        case DWAB_COMPRESSION:
+            return 256;
+
+        default:
+	        throw IEX_NAMESPACE::ArgExc ("Unknown compression type");
+    }
+}
+}
+
 int
 getScanlineChunkOffsetTableSize(const Header& header)
 {
     const Box2i &dataWindow = header.dataWindow();
 
-    vector<size_t> bytesPerLine;
-    size_t maxBytesPerLine = bytesPerLineTable (header,
-                                                bytesPerLine);
-
-    Compressor* compressor = newCompressor(header.compression(),
-                                           maxBytesPerLine,
-                                           header);
-
-    int linesInBuffer = numLinesInBuffer (compressor);
+    int linesInBuffer = numLinesInBuffer ( header.compression() );
 
     int lineOffsetSize = (dataWindow.max.y - dataWindow.min.y +
                           linesInBuffer) / linesInBuffer;
-
-    delete compressor;
 
     return lineOffsetSize;
 }
@@ -1849,18 +1901,30 @@ int
 getTiledChunkOffsetTableSize(const Header& header);
 
 int
-getChunkOffsetTableSize(const Header& header,bool ignore_attribute)
+getChunkOffsetTableSize(const Header& header,bool)
 {
-    if(!ignore_attribute && header.hasChunkCount())
-    {
-        return header.chunkCount();
-    }
-    
+    //
+    // if there is a type in the header which indicates the part is not a currently supported type,
+    // use the chunkCount attribute
+    //
+
+
     if(header.hasType()  && !isSupportedType(header.type()))
     {
-        throw IEX_NAMESPACE::ArgExc ("unsupported header type to "
-        "get chunk offset table size");
+        if(header.hasChunkCount())
+        {
+           return header.chunkCount();
+        }
+        else
+        {
+           throw IEX_NAMESPACE::ArgExc ("unsupported header type to "
+           "get chunk offset table size");
+        }
     }
+
+    //
+    // part is a known type - ignore the header attribute and compute the chunk size from the header
+    //
     if (isTiled(header.type()) == false)
         return getScanlineChunkOffsetTableSize(header);
     else

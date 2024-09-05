@@ -47,29 +47,18 @@
 #include "ImfSimd.h"
 #include "ImfSystemSpecific.h"
 #include "OpenEXRConfig.h"
+#include "OpenEXRConfigInternal.h"
 
 #include <half.h>
 #include <assert.h>
+
+#include <algorithm>
 
 OPENEXR_IMF_INTERNAL_NAMESPACE_HEADER_ENTER
 
 #define _SSE_ALIGNMENT        32
 #define _SSE_ALIGNMENT_MASK 0x0F
 #define _AVX_ALIGNMENT_MASK 0x1F
-
-//
-// Test if we should enable GCC inline asm paths for AVX
-//
-
-#ifdef OPENEXR_IMF_HAVE_GCC_INLINE_ASM_AVX 
-
-    #define IMF_HAVE_GCC_INLINEASM
-
-    #ifdef __LP64__
-        #define IMF_HAVE_GCC_INLINEASM_64
-    #endif /* __LP64__ */
-
-#endif /* OPENEXR_IMF_HAVE_GCC_INLINE_ASM_AVX */
 
 //
 // A simple 64-element array, aligned properly for SIMD access. 
@@ -85,15 +74,37 @@ class SimdAlignedBuffer64
             alloc();
         }
 
-        SimdAlignedBuffer64(const SimdAlignedBuffer64 &rhs): _handle(0)
+        SimdAlignedBuffer64(const SimdAlignedBuffer64 &rhs): _buffer (0), _handle(0)
         {
             alloc();
             memcpy (_buffer, rhs._buffer, 64 * sizeof (T));
         }
 
+        SimdAlignedBuffer64 &operator=(const SimdAlignedBuffer64 &rhs)
+        {
+            memcpy (_buffer, rhs._buffer, 64 * sizeof (T));
+            return *this;
+        }
+
+#if __cplusplus >= 201103L
+        SimdAlignedBuffer64(SimdAlignedBuffer64 &&rhs) noexcept
+        : _buffer(rhs._buffer), _handle(rhs._handle)
+        {
+            rhs._handle = nullptr;
+            rhs._buffer = nullptr;
+        }
+
+        SimdAlignedBuffer64 &operator=(SimdAlignedBuffer64 &&rhs) noexcept
+        {
+            std::swap(_handle, rhs._handle);
+            std::swap(_buffer, rhs._buffer);
+            return *this;
+        }
+#endif
         ~SimdAlignedBuffer64 ()
         {
-            EXRFreeAligned (_handle);
+            if (_handle)
+                EXRFreeAligned (_handle);
             _handle = 0;
             _buffer = 0;
         }
@@ -334,34 +345,37 @@ interleaveByte2 (char *dst, char *src0, char *src1, int numBytes)
         // use aligned loads
         //
     
-        for (int x = 0; x < 8; ++x)
+        for (int x = 0; x < std::min (numBytes, 8); ++x)
         {
             dst[2 * x]     = src0[x];
             dst[2 * x + 1] = src1[x];
         }
 
-        dst_epi8  = (__m128i*)&dst[16];
-        src0_epi8 = (__m128i*)&src0[8];
-        src1_epi8 = (__m128i*)&src1[8];
-        sseWidth  =  (numBytes - 8) / 16;
-
-        for (int x=0; x<sseWidth; ++x)
+        if (numBytes > 8) 
         {
-            _mm_stream_si128 (&dst_epi8[2 * x],
-                              _mm_unpacklo_epi8 (src0_epi8[x], src1_epi8[x]));
+            dst_epi8  = (__m128i*)&dst[16];
+            src0_epi8 = (__m128i*)&src0[8];
+            src1_epi8 = (__m128i*)&src1[8];
+            sseWidth  =  (numBytes - 8) / 16;
 
-            _mm_stream_si128 (&dst_epi8[2 * x + 1],
-                              _mm_unpackhi_epi8 (src0_epi8[x], src1_epi8[x]));
-        }
+            for (int x=0; x<sseWidth; ++x)
+            {
+                _mm_stream_si128 (&dst_epi8[2 * x],
+                                  _mm_unpacklo_epi8 (src0_epi8[x], src1_epi8[x]));
 
-        //
-        // Then do run the leftovers one at a time
-        //
+                _mm_stream_si128 (&dst_epi8[2 * x + 1],
+                                  _mm_unpackhi_epi8 (src0_epi8[x], src1_epi8[x]));
+            }
 
-        for (int x = 16 * sseWidth + 8; x < numBytes; ++x)
-        {
-            dst[2 * x]     = src0[x];
-            dst[2 * x + 1] = src1[x];
+            //
+            // Then do run the leftovers one at a time
+            //
+
+            for (int x = 16 * sseWidth + 8; x < numBytes; ++x)
+            {
+                dst[2 * x]     = src0[x];
+                dst[2 * x + 1] = src1[x];
+            }
         }
     }
     else
@@ -439,7 +453,7 @@ convertFloatToHalf64_f16c (unsigned short *dst, float *src)
     // I'll take the asm.
     //
 
-    #if defined IMF_HAVE_GCC_INLINEASM
+    #if defined IMF_HAVE_GCC_INLINEASM_X86
         __asm__
            ("vmovaps       (%0),     %%ymm0         \n"
             "vmovaps   0x20(%0),     %%ymm1         \n"
@@ -478,7 +492,7 @@ convertFloatToHalf64_f16c (unsigned short *dst, float *src)
            );
     #else
         convertFloatToHalf64_scalar (dst, src);
-    #endif /* IMF_HAVE_GCC_INLINEASM */
+    #endif /* IMF_HAVE_GCC_INLINEASM_X86 */
 }
 
 
@@ -655,7 +669,7 @@ fromHalfZigZag_scalar (unsigned short *src, float *dst)
 void 
 fromHalfZigZag_f16c (unsigned short *src, float *dst)
 {
-    #if defined IMF_HAVE_GCC_INLINEASM_64
+    #if defined IMF_HAVE_GCC_INLINEASM_X86_64
         __asm__
 
            /* x3 <- 0                    
@@ -807,7 +821,7 @@ fromHalfZigZag_f16c (unsigned short *src, float *dst)
 
     #else
         fromHalfZigZag_scalar(src, dst);
-    #endif /* defined IMF_HAVE_GCC_INLINEASM_64 */
+    #endif /* defined IMF_HAVE_GCC_INLINEASM_X86_64 */
 }
 
 
@@ -1579,7 +1593,7 @@ template <int zeroedRows>
 void
 dctInverse8x8_avx (float *data)
 {
-    #if defined IMF_HAVE_GCC_INLINEASM_64
+    #if defined IMF_HAVE_GCC_INLINEASM_X86_64
 
     /* The column-major version of M1, followed by the 
      * column-major version of M2:
@@ -1707,11 +1721,11 @@ dctInverse8x8_avx (float *data)
         } else {
             assert(false); // Invalid template instance parameter
         }
-    #else  /* IMF_HAVE_GCC_INLINEASM_64 */
+    #else  /* IMF_HAVE_GCC_INLINEASM_X86_64 */
 
         dctInverse8x8_scalar<zeroedRows>(data);
 
-    #endif /*  IMF_HAVE_GCC_INLINEASM_64 */
+    #endif /*  IMF_HAVE_GCC_INLINEASM_X86_64 */
 }
 
 
@@ -2138,7 +2152,7 @@ dctForward8x8 (float *data)
 
 #endif /* IMF_HAVE_SSE2 */
 
-} // anonymous namespace
+} // namespace
 
 OPENEXR_IMF_INTERNAL_NAMESPACE_HEADER_EXIT
 

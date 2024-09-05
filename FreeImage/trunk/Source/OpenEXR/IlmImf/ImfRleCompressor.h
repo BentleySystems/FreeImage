@@ -49,20 +49,30 @@
 OPENEXR_IMF_INTERNAL_NAMESPACE_HEADER_ENTER
 
 
-class IMF_EXPORT RleCompressor: public Compressor
+class RleCompressor: public Compressor
 {
   public:
 
+    IMF_EXPORT
     RleCompressor (const Header &hdr, size_t maxScanLineSize);
+    IMF_EXPORT
     virtual ~RleCompressor ();
 
+    RleCompressor (const RleCompressor& other) = delete;
+    RleCompressor& operator = (const RleCompressor& other) = delete;
+    RleCompressor (RleCompressor&& other) = delete;
+    RleCompressor& operator = (RleCompressor&& other) = delete;
+
+    IMF_EXPORT
     virtual int numScanLines () const;
 
+    IMF_EXPORT
     virtual int	compress (const char *inPtr,
 			  int inSize,
 			  int minY,
 			  const char *&outPtr);
 
+    IMF_EXPORT
     virtual int	uncompress (const char *inPtr,
 			    int inSize,
 			    int minY,

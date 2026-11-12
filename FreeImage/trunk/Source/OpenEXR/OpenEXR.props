@@ -1,0 +1,18 @@
+<?xml version="1.0" encoding="utf-8"?>
+<Project xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+  <PropertyGroup>
+    <FreeImageEXRRoot>$(MSBuildThisFileDirectory)$(Platform)\$(Configuration)\</FreeImageEXRRoot>
+  </PropertyGroup>
+  <ItemDefinitionGroup>
+    <ClCompile>
+      <AdditionalIncludeDirectories>$(MSBuildThisFileDirectory)native\include;$(MSBuildThisFileDirectory)native\include\OpenEXR;$(MSBuildThisFileDirectory)native\include\Imath;$(MSBuildThisFileDirectory)upstream\openexr\src\lib;$(MSBuildThisFileDirectory)upstream\openexr\src\lib\OpenEXR;$(MSBuildThisFileDirectory)upstream\openexr\src\lib\Iex;$(MSBuildThisFileDirectory)upstream\openexr\src\lib\OpenEXRCore;$(MSBuildThisFileDirectory)upstream\imath\src;$(MSBuildThisFileDirectory)upstream\imath\src\Imath;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+      <LanguageStandard>stdcpp17</LanguageStandard>
+    </ClCompile>
+    <Link>
+      <AdditionalDependencies>$(FreeImageEXRRoot)OpenEXR.lib;%(AdditionalDependencies)</AdditionalDependencies>
+    </Link>
+    <Lib>
+      <AdditionalDependencies>$(FreeImageEXRRoot)OpenEXR.lib;%(AdditionalDependencies)</AdditionalDependencies>
+    </Lib>
+  </ItemDefinitionGroup>
+</Project>

@@ -178,16 +178,16 @@ void testMultiPage(const char *lpszPathName) {
 	printf("testMultiPage ...\n");
 
 	// test multipage creation
-	testBuildMPage(lpszPathName, "sample.ico", FIF_ICO, 24);
-	testBuildMPage(lpszPathName, "sample.tif", FIF_TIFF, 24);
-	testBuildMPage(lpszPathName, "sample.gif", FIF_GIF, 8);
+	testBuildMPage(lpszPathName, testOutputPath("sample.ico").c_str(), FIF_ICO, 24);
+	testBuildMPage(lpszPathName, testOutputPath("sample.tif").c_str(), FIF_TIFF, 24);
+	testBuildMPage(lpszPathName, testOutputPath("sample.gif").c_str(), FIF_GIF, 8);
 
 	// test multipage copy
-	testCloneMultiPage(FIF_TIFF, "sample.tif", "clone.tif", TIFF_LZW);
+	testCloneMultiPage(FIF_TIFF, testOutputPath("sample.tif").c_str(), testOutputPath("clone.tif").c_str(), TIFF_LZW);
 
 	// test multipage lock & delete
-	testLockDeleteMultiPage("clone.tif");
+	testLockDeleteMultiPage(testOutputPath("clone.tif").c_str());
 
 	// test multipage cache
-	testMPageCache(lpszPathName, "mpages.tif");
+	testMPageCache(lpszPathName, testOutputPath("mpages.tif").c_str());
 }

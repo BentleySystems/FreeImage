@@ -2,7 +2,7 @@
 // HDR Loader and writer
 //
 // Design and implementation by 
-// - Hervé Drolon (drolon@infonie.fr)
+// - Hervï¿½ Drolon (drolon@infonie.fr)
 //
 // This file is part of FreeImage 3
 //
@@ -18,6 +18,9 @@
 //
 // Use at your own risk!
 // ==========================================================
+
+#include <errno.h>
+#include <stdlib.h>
 
 #include "FreeImage.h"
 #include "Utilities.h"
@@ -82,6 +85,7 @@ typedef enum {
 
 static BOOL rgbe_Error(rgbe_error_code error_code, const char *msg);
 static BOOL rgbe_GetLine(FreeImageIO *io, fi_handle handle, char *buffer, int length);
+static BOOL rgbe_ParseSize(const char *line, const char *tag1, const char *tag2, unsigned *first, unsigned *second);
 static inline void rgbe_FloatToRGBE(BYTE rgbe[4], FIRGBF *rgbf);
 static inline void rgbe_RGBEToFloat(FIRGBF *rgbf, BYTE rgbe[4]);
 static BOOL rgbe_ReadHeader(FreeImageIO *io, fi_handle handle, unsigned *width, unsigned *height, rgbeHeaderInfo *header_info);
@@ -136,6 +140,38 @@ rgbe_GetLine(FreeImageIO *io, fi_handle handle, char *buffer, int length) {
 	}
 	
 	return (i < length) ? TRUE : FALSE;
+}
+
+/**
+Parse "<tag1> <n> <tag2> <m>" with strict range checking (both values must be in [1, INT_MAX]).
+sscanf("%d") has undefined behavior on overflow and cannot report it.
+*/
+static BOOL 
+rgbe_ParseSize(const char *line, const char *tag1, const char *tag2, unsigned *first, unsigned *second) {
+	unsigned *out[2] = { first, second };
+	const char *tags[2] = { tag1, tag2 };
+	const char *p = line;
+
+	for(int i = 0; i < 2; i++) {
+		while(isspace((unsigned char)*p)) {
+			p++;
+		}
+		if(strncmp(p, tags[i], 2) != 0) {
+			return FALSE;
+		}
+		p += 2;
+
+		char *end = NULL;
+		errno = 0;
+		const long value = strtol(p, &end, 10);
+		if((end == p) || (errno == ERANGE) || (value < 1) || (value > INT_MAX)) {
+			return FALSE;
+		}
+		*out[i] = (unsigned)value;
+		p = end;
+	}
+
+	return TRUE;
 }
 
 /**
@@ -212,7 +248,7 @@ rgbe_ReadHeader(FreeImageIO *io, fi_handle handle, unsigned *width, unsigned *he
 	else {
 		header_info->valid |= RGBE_VALID_PROGRAMTYPE;
 		for(i = 0; i < sizeof(header_info->programtype) - 1; i++) {
-			if ((buf[i + 2] == 0) || isspace(buf[i + 2])) {
+			if ((buf[i + 2] == 0) || isspace((unsigned char)buf[i + 2])) {
 				break;
 			}
 			header_info->programtype[i] = buf[i+2];
@@ -258,9 +294,9 @@ rgbe_ReadHeader(FreeImageIO *io, fi_handle handle, unsigned *width, unsigned *he
 	}
 
 	// get the image width & height
-	if(sscanf(buf,"-Y %d +X %d", height, width) < 2) {
-		if(sscanf(buf,"+X %d +Y %d", height, width) < 2) {
-			return rgbe_Error(rgbe_format_error, "missing image size specifier");
+	if(!rgbe_ParseSize(buf, "-Y", "+X", height, width)) {
+		if(!rgbe_ParseSize(buf, "+X", "+Y", height, width)) {
+			return rgbe_Error(rgbe_format_error, "missing or invalid image size specifier");
 		}
 	}
 

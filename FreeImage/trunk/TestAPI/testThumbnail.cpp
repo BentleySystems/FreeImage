@@ -59,7 +59,8 @@ static BOOL testSaveThumbnail(const char *lpszPathName, int flags) {
 	BOOL bResult = FALSE;
 	FIBITMAP *dib = NULL;
 	FIBITMAP *t_clone = NULL;
-	const char *lpszImagePathName = "exif_new_thumb.jpg";
+	const std::string outputPath = testOutputPath("exif_new_thumb.jpg");
+	const char *lpszImagePathName = outputPath.c_str();
 
 	try {
 		FREE_IMAGE_FORMAT fif = FreeImage_GetFileType(lpszPathName);

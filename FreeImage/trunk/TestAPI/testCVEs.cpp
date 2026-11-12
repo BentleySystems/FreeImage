@@ -1,0 +1,2220 @@
+#ifdef WIN32
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#endif
+
+#include "TestSuite.h"
+
+#include <string>
+#include <string.h>
+#include <stdio.h>
+#include <vector>
+#ifndef WIN32
+#include <unistd.h>
+#endif
+
+enum CVEExpectation {
+	RejectImage,
+	DecodeOrReject,
+	DecodeRequired,
+	DisabledCodec,
+	// The fixture must decode to a bitmap with pixels on both entry points;
+	// rejection fails. For corrupt inputs whose fixed loader is known to keep
+	// the decodable part (no control pixels to compare, unlike DecodeRequired).
+	DecodeAny
+};
+
+struct CVECase;
+
+// Synthetic cases build their input in the worker instead of reading a
+// committed fixture. The function receives the case (including `variant`) and
+// performs its own file + memory loads and assertions.
+typedef bool (*SyntheticCheck)(const CVECase &test);
+
+#define SYNTHETIC_FIXTURE "(synthetic)"
+
+struct CVECase {
+	const char *id;
+	const char *fixture;
+	FREE_IMAGE_FORMAT format;
+	int flags;
+	CVEExpectation expectation;
+	// When true, both the file and the from-memory autodetection must name this
+	// case's decoder; a generic FIF_UNKNOWN is not acceptable. Used by the
+	// reconstructed XPM cases to prove the magic is recognised even though the
+	// decoder is disabled.
+	bool requireExactFormat;
+	// Non-NULL for in-worker generated inputs (fixture == SYNTHETIC_FIXTURE).
+	SyntheticCheck synthetic;
+	int variant;
+};
+
+// Synthetic families (defined after the guard-message capture helpers).
+static bool runTIFFPhotoshopThumbnailCase(const CVECase &test);
+static bool runExifDirectoryCase(const CVECase &test);
+static bool runHDRDimensionCase(const CVECase &test);
+// Format round-trip / decode validation, implemented in testFormats.cpp.
+static bool runFormatCase(const CVECase &test) {
+	return runFormatTest(test.format, test.variant, test.id);
+}
+
+// Legacy codecs that FreeImage_Initialise switches off (Plugin.cpp,
+// DisableLegacyCodecs): the codec must not be reachable by content detection,
+// by an explicit format id, or by re-enabling the plugin.
+static bool runLegacyCodecDisabledCase(const CVECase &test) {
+	const FREE_IMAGE_FORMAT fif = test.format;
+	bool passed = true;
+
+	if (FreeImage_IsPluginEnabled(fif)) {
+		printf("[FAIL] %s: plugin is still enabled\n", test.id);
+		passed = false;
+	}
+	// Re-enabling must not bring the decoder back.
+	FreeImage_SetPluginEnabled(fif, TRUE);
+	if (FreeImage_FIFSupportsReading(fif) || FreeImage_FIFSupportsWriting(fif)
+		|| FreeImage_FIFSupportsICCProfiles(fif) || FreeImage_FIFSupportsNoPixels(fif)) {
+		printf("[FAIL] %s: decoder or encoder is reachable after re-enabling\n", test.id);
+		passed = false;
+	}
+	for (int depth = 1; depth <= 128; ++depth) {
+		if (FreeImage_FIFSupportsExportBPP(fif, depth)) {
+			printf("[FAIL] %s: still reports export bit depth %d\n", test.id, depth);
+			passed = false;
+			break;
+		}
+	}
+	for (int type = FIT_BITMAP; type <= FIT_RGBAF; ++type) {
+		if (FreeImage_FIFSupportsExportType(fif, (FREE_IMAGE_TYPE)type)) {
+			printf("[FAIL] %s: still reports export type %d\n", test.id, type);
+			passed = false;
+			break;
+		}
+	}
+
+	// An explicit load of arbitrary bytes returns nothing.
+	BYTE bytes[256];
+	memset(bytes, 0, sizeof(bytes));
+	FIMEMORY *stream = FreeImage_OpenMemory(bytes, (DWORD)sizeof(bytes));
+	FIBITMAP *bitmap = stream ? FreeImage_LoadFromMemory(fif, stream, 0) : NULL;
+	if (bitmap) {
+		printf("[FAIL] %s: explicit load returned a bitmap\n", test.id);
+		FreeImage_Unload(bitmap);
+		passed = false;
+	}
+	if (stream) FreeImage_CloseMemory(stream);
+	return passed;
+}
+// Rotation validation, implemented in testRotate.cpp. The format only has to
+// name an always-available decoder for the prerequisite check.
+static bool runRotateCase(const CVECase &test) {
+	return runRotateTest(test.variant, test.id);
+}
+
+// TIFF Photoshop-resource thumbnail variants (psdThumbnail::Read).
+enum {
+	PSDT_RAW_OK, PSDT_JPEG_OK, PSDT_ROWBYTES, PSDT_BPP, PSDT_HEIGHT_NEG, PSDT_WIDTH_ZERO,
+	PSDT_TRUNCATED, PSDT_SHORT_RESOURCE, PSDT_OVERSIZE_RESOURCE, PSDT_FORMAT_UNKNOWN,
+	PSDT_JPEG_GARBAGE, PSDT_DISPLAYINFO_THROW, PSDT_ODD_RAW_OK, PSDT_ODD_PAD_COMPLETES_ROW
+};
+
+// Shared EXIF directory-parser variants (jpeg_read_exif_dir and callers).
+enum {
+	EXIF_CONTROL, EXIF_IFD0_AT_END, EXIF_IFD0_STRADDLE, EXIF_SUBIFD_COUNT_AT_END,
+	EXIF_SUBIFD_ENTRY_STRADDLE, EXIF_MAKERNOTE_OUTSIDE, EXIF_MAKERNOTE_SHORT_SIGNATURE,
+	EXIF_CANON_SUBTAG_WIDTH, EXIF_IFD1_COUNT_AT_END, EXIF_APP1_SHORT_HEADER, EXIF_APP1_TINY
+};
+
+// HDR dimension-line (rgbe_ParseSize) variants.
+enum {
+	HDR_FLAT_OK, HDR_RLE_ROUNDTRIP_OK, HDR_PLUS_X_OK, HDR_WHITESPACE_OK, HDR_ONE_BY_ONE_OK,
+	HDR_ZERO_HEIGHT, HDR_ZERO_WIDTH, HDR_NEGATIVE, HDR_ABOVE_INT_MAX, HDR_ERANGE,
+	HDR_MISSING_VALUE, HDR_MISSING_TAG, HDR_NON_NUMERIC, HDR_TRUNCATED_PIXELS
+};
+
+static const CVECase cveCases[] = {
+		// CVE-2015-0852 - PCX dimension underflow when the window fields are
+		// reversed. Four reconstructed fixtures (all generated by
+		// gen_cve_2015_0852.py, byte-deterministic):
+		//   CVE-2015-0852.pcx   : combined reversed window (left=10,right=5,
+		//                          top=10,bottom=5).
+		//   CVE-2015-0852-h.pcx : horizontal half only (left=10,right=5,
+		//                          top=10,bottom=11).
+		//   CVE-2015-0852-v.pcx : vertical half only (left=10,right=11,
+		//                          top=10,bottom=5).
+		//   CVE-2015-0852-ok.pcx: valid 2x2 24-bit RLE control with a complete
+		//                          raster body; must decode to exact pixels.
+		// The PluginPCX guard (PluginPCX.cpp:389
+		// `if((left >= right) || (top >= bottom)) throw FI_MSG_ERROR_PARSING;`)
+		// must reject each reversed fixture via both load paths, while the ok
+		// control must decode and reproduce its expected pixels. The h/v
+		// single-axis fixtures let a regression that drops either guard operand
+		// be caught on its own axis; the ok control uses a decode-required
+		// assertion (not DecodeOrReject), so a regression that rejects every PCX
+		// cannot satisfy it.
+		{ "CVE-2015-0852",    "POCFiles/CVE-2015-0852.pcx",    FIF_PCX, 0, DisabledCodec, false },
+		{ "CVE-2015-0852-h",  "POCFiles/CVE-2015-0852-h.pcx",  FIF_PCX, 0, DisabledCodec, false },
+		{ "CVE-2015-0852-v",  "POCFiles/CVE-2015-0852-v.pcx",  FIF_PCX, 0, DisabledCodec, false },
+		{ "CVE-2015-0852-ok", "POCFiles/CVE-2015-0852-ok.pcx", FIF_PCX, 0, DisabledCodec, false },
+		// CVE-2016-5684 - XPM out-of-bounds read/write in the colour-definition
+		// tab-substitution of PluginXPM.cpp Load() (Talos TALOS-2016-0189; the
+		// advisory says "XMP" but the affected code is XPM). The historical
+		// parser slices the first `cpp` bytes of a colour-definition string with
+		// std::string(str, cpp) and points `keys = str + cpp`, then does an
+		// out-of-bounds tab-to-space substitution over `keys`; a crafted `cpp`
+		// (the 4th %d of the info line) moves `keys` past the string. This is
+		// the reported defect. No vendor POC was published (Seebug "Unavailable
+		// PoC") and the initial-import revision f453967 already guards cpp<=0 and
+		// strlen(str)<cpp, so it is not, by itself, a verified-unpatched
+		// reference; these are malformed-input rejection regressions, not a
+		// demonstrated OOB. Four byte-deterministic fixtures (gen_cve_2016_5684.py)
+		// are identical except the single chars-per-pixel integer:
+		//   CVE-2016-5684.xpm        cpp=1, a well-formed control.
+		//   CVE-2016-5684-cpp0.xpm   cpp=0 (refused by the cpp <= 0 guard).
+		//   CVE-2016-5684-cppneg.xpm cpp=-1 (refused by the cpp <= 0 guard).
+		//   CVE-2016-5684-cppbig.xpm cpp=13, larger than the complete
+		//                          colour-definition string (12 bytes) -> refused
+		//                          by the strlen(str) < cpp guard.
+		// The fork disables XPM: the loader was removed (b72b548) and the plugin
+		// is recognition-only (load_proc/save_proc NULL), so the "/* XPM */"
+		// magic is still recognised by the Validate callback even though decoding
+		// is gone. requireExactFormat=true makes autodetection name FIF_XPM on both
+		// the file and the from-memory paths (a generic FIF_UNKNOWN would not
+		// prove the magic was seen). DisabledCodec additionally requires every
+		// capability query to report unsupported, plus file/memory rejection.
+		// POCFiles/xpm_ref.py accepts the control in a limited syntax model;
+		// it does not decode pixels or prove historical decoder behavior.
+		// An accidental re-enablement that decoded the control would fail here.
+		// The cpp variants run the
+		// default and FIF_LOAD_NOPIXELS modes.
+		{ "CVE-2016-5684",        "POCFiles/CVE-2016-5684.xpm",        FIF_XPM, 0, DisabledCodec, true },
+		{ "CVE-2016-5684-cpp0",   "POCFiles/CVE-2016-5684-cpp0.xpm",   FIF_XPM, 0, DisabledCodec, true },
+		{ "CVE-2016-5684-cppneg", "POCFiles/CVE-2016-5684-cppneg.xpm", FIF_XPM, 0, DisabledCodec, true },
+		{ "CVE-2016-5684-cppbig", "POCFiles/CVE-2016-5684-cppbig.xpm", FIF_XPM, 0, DisabledCodec, true },
+	{"CVE-2019-12211", "POCFiles/CVE-2019-12211.tiff", FIF_TIFF, 0, DecodeOrReject, false},
+	{"CVE-2019-12212", "POCFiles/CVE-2019-12212.jxr", FIF_JXR, 0, DecodeOrReject, false},
+	{"CVE-2019-12213", "POCFiles/CVE-2019-12213.tiff", FIF_TIFF, 0, DecodeOrReject, false},
+	{"CVE-2020-21426", "POCFiles/CVE-2020-21426.exr", FIF_EXR, 0, DecodeOrReject, false},
+	{"CVE-2020-21427", "POCFiles/CVE-2020-21427.bmp", FIF_BMP, 0, DecodeOrReject, false},
+	{"CVE-2020-21428", "POCFiles/CVE-2020-21428.dds", FIF_DDS, 0, DisabledCodec, false},
+	{"CVE-2020-22524", "POCFiles/CVE-2020-22524.pfm", FIF_PFM, 0, DisabledCodec, false},
+	{"CVE-2020-24292", "POCFiles/CVE-2020-24292.ico", FIF_ICO, 0, DisabledCodec, false},
+	{"CVE-2020-24293", "POCFiles/CVE-2020-24293.psd", FIF_PSD, 0, DisabledCodec, false},
+	{"CVE-2020-24294", "POCFiles/CVE-2020-24294.psd", FIF_PSD, 0, DisabledCodec, false},
+	{"CVE-2020-24295", "POCFiles/CVE-2020-24295.psd", FIF_PSD, 0, DisabledCodec, false},
+	{"CVE-2021-40262", "POCFiles/CVE-2021-40262.raw", FIF_RAW, 0, DecodeOrReject, false},
+	{"CVE-2021-40263", "POCFiles/CVE-2021-40263.tiff", FIF_TIFF, 0, DecodeOrReject, false},
+	{"CVE-2021-40264", "POCFiles/CVE-2021-40264.tiff", FIF_TIFF, 0, DecodeOrReject, false},
+	{"CVE-2021-40265", "POCFiles/CVE-2021-40265.jpg", FIF_JPEG, 0, RejectImage, false},
+	{"CVE-2021-40266", "POCFiles/CVE-2021-40266.tiff", FIF_TIFF, 0, RejectImage, false},
+	{"CVE-2023-47992", "CVE-2023-47992.bmp", FIF_BMP, 0, DecodeOrReject, false},
+	{"CVE-2023-47993", "CVE-2023-47993.jpg", FIF_JPEG, 0, DecodeOrReject, false},
+	{"CVE-2023-47994", "CVE-2023-47994.bmp", FIF_BMP, 0, RejectImage, false},
+	{"CVE-2023-47995", "CVE-2023-47995.bmp", FIF_JPEG, 0, RejectImage, false},
+	{"CVE-2023-47996", "CVE-2023-47996.jpg", FIF_JPEG, 0, DecodeOrReject, false},
+	{"CVE-2023-47997", "CVE-2023-47997.tiff", FIF_TIFF, 0, DecodeOrReject, false},
+	{"CVE-2024-28562-case757", "POCFiles/CVE-2024-28562-case757", FIF_EXR, 0, DecodeOrReject, false},
+	{"CVE-2024-28563-case10451", "POCFiles/CVE-2024-28563-case10451", FIF_EXR, 0, DecodeOrReject, false},
+	{"CVE-2024-28564-case10574", "POCFiles/CVE-2024-28564-case10574", FIF_EXR, 0, DecodeOrReject, false},
+	{"CVE-2024-28565-case11043", "POCFiles/CVE-2024-28565-case11043", FIF_PSD, 0, DisabledCodec, false},
+	// CVE-2024-28566 - TIFF generic strip loader wrote/read past the bitmap or
+	// the strip buffer: the separate-plane loop never advanced the source for
+	// sub-byte samples and could put channelOffset past the destination pixel,
+	// and the contiguous loop copied up to the padded pitch instead of 'width'
+	// pixels (case10458 over-read the strip buffer by 2 bytes under ASan). Both
+	// files carry sample layouts the loader cannot map onto the bitmap, which is
+	// now rejected as unsupported. Valid separate-plane and contiguous controls:
+	// FORMAT-TIFF-planar.
+	{"CVE-2024-28566-case10422", "POCFiles/CVE-2024-28566-case10422", FIF_TIFF, 0, RejectImage, false},
+	{"CVE-2024-28566-case10458", "POCFiles/CVE-2024-28566-case10458", FIF_TIFF, 0, RejectImage, false},
+	// CVE-2024-28567 - ICC use-after-free: ReadMetadata switches to the EXIF IFD
+	// and back, which frees the directory holding the ICC buffer fetched earlier.
+	// The buffer is now re-fetched after ReadMetadata. The images themselves are
+	// decodable.
+	{"CVE-2024-28567-case10370", "POCFiles/CVE-2024-28567-case10370", FIF_TIFF, 0, DecodeAny, false},
+	{"CVE-2024-28567-case10612", "POCFiles/CVE-2024-28567-case10612", FIF_TIFF, 0, DecodeAny, false},
+	// CVE-2024-28568 / CVE-2024-9029 - RichTIFFIPTC over-read: LibTIFF 4 reports
+	// the tag count in bytes but FreeImage multiplied it by 4 (and byte-swapped
+	// again). The pixel data is intact, so both files decode. Valid IPTC controls
+	// (round trip and Adobe LONG-typed tag): FORMAT-TIFF-iptc.
+	{"CVE-2024-28568-case10480", "POCFiles/CVE-2024-28568-case10480", FIF_TIFF, 0, DecodeAny, false},
+	{"CVE-2024-28569-case202", "POCFiles/CVE-2024-28569-case202", FIF_EXR, 0, DecodeOrReject, false},
+	{"CVE-2024-28570-case10637", "POCFiles/CVE-2024-28570-case10637", FIF_JPEG, 0, DecodeOrReject, false},
+	{"CVE-2024-28570-case10979", "POCFiles/CVE-2024-28570-case10979", FIF_JPEG, 0, DecodeOrReject, false},
+	{"CVE-2024-28571-case10137", "POCFiles/CVE-2024-28571-case10137", FIF_PSD, 0, DisabledCodec, false},
+	{"CVE-2024-28571-case10261", "POCFiles/CVE-2024-28571-case10261", FIF_JPEG, 0, DecodeOrReject, false},
+	{"CVE-2024-28571-case1939", "POCFiles/CVE-2024-28571-case1939", FIF_JPEG, 0, DecodeOrReject, false},
+	{"CVE-2024-28572-case10549", "POCFiles/CVE-2024-28572-case10549", FIF_JPEG, 0, DecodeOrReject, false},
+	{"CVE-2024-28573-case10871", "POCFiles/CVE-2024-28573-case10871", FIF_JPEG, 0, DecodeOrReject, false},
+	{"CVE-2024-28574-case102", "POCFiles/CVE-2024-28574-case102", FIF_J2K, 0, DecodeOrReject, false},
+	{"CVE-2024-28575-case11111", "POCFiles/CVE-2024-28575-case11111", FIF_J2K, 0, DecodeOrReject, false},
+	{"CVE-2024-28576-case10298", "POCFiles/CVE-2024-28576-case10298", FIF_J2K, 0, DecodeOrReject, false},
+	{"CVE-2024-28577-case10007", "POCFiles/CVE-2024-28577-case10007", FIF_WEBP, 0, DecodeOrReject, false},
+	// CVE-2024-28577 WebP EXIF decode-time rejection. The WebP Load path
+	// (PluginWebP.cpp:408) feeds the WebP EXIF chunk to jpeg_read_exif_profile,
+	// the shared EXIF parser whose guards throw const char* diagnostics
+	// ("Invalid entriesCount0th", Exif.cpp:842, the CVE-2023-47993 guard;
+	// "Invalid next IFD offset", Exif.cpp:853, the CVE-2021-33367 full-field
+	// guard). PluginWebP.cpp's Load used to catch only int there, so a WebP with
+	// such an EXIF chunk let that const char* throw escape
+	// FreeImage_Load/FreeImage_LoadFromHandle and terminate the caller while the
+	// MUX object, the decoded bitmap and the frame bitstream went uncleaned.
+	// Load now catches const char*, forwards the diagnostic via
+	// FreeImage_OutputMessageProc, unloads the bitmap, frees the frame bitstream
+	// and returns NULL so the generic loader path performs normal MUX cleanup.
+	// Both fixtures (POCFiles/gen_cve_2024_28577.py, byte-deterministic) share
+	// one container: VP8X with the EXIF flag and an 8x8 canvas, a VP8 frame that
+	// decodes to 8x8 (so Load allocates the bitmap and reaches the EXIF chunk),
+	// and a 16-byte EXIF chunk carrying "Exif\0\0", a little-endian TIFF header
+	// with 0th-IFD offset 8, and a two-byte entriesCount0th field (dwLength=10
+	// covers only the count itself). Only that count differs:
+	//   webp-exif-decode : entriesCount0th=1, so DIR_ENTRY_ADDR(ifd0th,1)-tiffp
+	//                      = 22 > dwLength=10 and the parser throws "Invalid
+	//                      entriesCount0th".
+	//   webp-exif-nextifd: entriesCount0th=0, so the entriesCount start check
+	//                      (10 > 10) passes but the 4-byte next-IFD field does
+	//                      not fit (10+4 > 10) and the parser throws "Invalid
+	//                      next IFD offset"; on an unfixed parser the ReadUint32
+	//                      at Exif.cpp:856 would run four bytes past the profile
+	//                      buffer the WebP loader handed it.
+	// Both must be rejected on both load paths with the matching diagnostic in
+	// each entry point's captured transcript (webpExifGuard), so a regression
+	// that stops catching const char* surfaces as a worker crash here and an
+	// early, unrelated rejection cannot satisfy the assertion. Each worker also
+	// runs a valid-WebP decode control (checkWebPValidImages) including
+	// header-only mode, so these rejections cannot pass by the codec rejecting
+	// every WebP.
+	{"CVE-2024-28577-webp-exif-decode", "POCFiles/CVE-2024-28577-webp-exif-decode.webp", FIF_WEBP, 0, RejectImage, false},
+	{"CVE-2024-28577-webp-exif-nextifd", "POCFiles/CVE-2024-28577-webp-exif-nextifd.webp", FIF_WEBP, 0, RejectImage, false},
+	// RAS, XBM and XPM are recognition-only in this fork (load_proc/save_proc
+	// NULL). Their samples use DisabledCodec (every capability unsupported,
+	// file/memory rejection) with exact format detection. case1001 is a TIFF
+	// file on the live TIFF loader.
+	{"CVE-2024-28578-case10002", "POCFiles/CVE-2024-28578-case10002", FIF_RAS, 0, DisabledCodec, true},
+	{"CVE-2024-28578-case1001", "POCFiles/CVE-2024-28578-case1001", FIF_TIFF, 0, DecodeOrReject, false},
+	{"CVE-2024-28578-case10035", "POCFiles/CVE-2024-28578-case10035", FIF_RAS, 0, DisabledCodec, true},
+	{"CVE-2024-28578-case10081", "POCFiles/CVE-2024-28578-case10081", FIF_RAS, 0, DisabledCodec, true},
+	{"CVE-2024-28579-case1795", "POCFiles/CVE-2024-28579-case1795", FIF_HDR, 0, DecodeOrReject, false},
+	{"CVE-2024-28580-case10003", "POCFiles/CVE-2024-28580-case10003", FIF_RAS, 0, DisabledCodec, true},
+	{"CVE-2024-28580-case10551", "POCFiles/CVE-2024-28580-case10551", FIF_RAS, 0, DisabledCodec, true},
+	{"CVE-2024-28580-case10631", "POCFiles/CVE-2024-28580-case10631", FIF_RAS, 0, DisabledCodec, true},
+	// CVE-2024-28581 - TARGA RLE loader: a packet running past the last row
+	// wrote beyond the bitmap (the old guard assumed rows were 'line' bytes
+	// apart, not 'pitch'), and a cache smaller than one pixel returned short
+	// buffers (case10421: 4-byte read of a 1-byte cache). Writes are now bounded
+	// per pixel by row and height, and the cache always holds a full pixel. The
+	// loader keeps its documented behaviour of returning the rows decoded before
+	// the corruption, so these files decode. Valid RLE controls at 8/16/24/32
+	// bits: FORMAT-TGA-truecolor, FORMAT-TGA-palette, FORMAT-TGA-16bit-to-24.
+	{"CVE-2024-28581-case10024", "POCFiles/CVE-2024-28581-case10024", FIF_TARGA, 0, DecodeAny, false},
+	{"CVE-2024-28581-case10412", "POCFiles/CVE-2024-28581-case10412", FIF_TARGA, 0, DecodeAny, false},
+	{"CVE-2024-28581-case10421", "POCFiles/CVE-2024-28581-case10421", FIF_TARGA, 0, DecodeAny, false},
+	{"CVE-2024-28581-case10470", "POCFiles/CVE-2024-28581-case10470", FIF_TARGA, 0, DecodeAny, false},
+	{"CVE-2024-28581-case10800", "POCFiles/CVE-2024-28581-case10800", FIF_TARGA, 0, DecodeAny, false},
+	{"CVE-2024-28581-case10955", "POCFiles/CVE-2024-28581-case10955", FIF_TARGA, 0, DecodeAny, false},
+	{"CVE-2024-28582-case10038", "POCFiles/CVE-2024-28582-case10038", FIF_HDR, 0, DecodeOrReject, false},
+	{"CVE-2024-28582-case10130", "POCFiles/CVE-2024-28582-case10130", FIF_HDR, 0, DecodeOrReject, false},
+	{"CVE-2024-28582-case2845", "POCFiles/CVE-2024-28582-case2845", FIF_HDR, 0, DecodeOrReject, false},
+	{"CVE-2024-28583-case10465", "POCFiles/CVE-2024-28583-case10465", FIF_XBM, 0, DisabledCodec, true},
+	{"CVE-2024-28584-case10240", "POCFiles/CVE-2024-28584-case10240", FIF_J2K, 0, DecodeOrReject, false},
+	{"CVE-2024-31570-case10231", "POCFiles/CVE-2024-31570-case10231", FIF_XPM, 0, DisabledCodec, true},
+	// CVE-2024-9029 - same RichTIFFIPTC over-read as CVE-2024-28568 above.
+	{"CVE-2024-9029-crash-7582b9a9b1f37e4af199f2a98c4bb287e0a811ce", "POCFiles/CVE-2024-9029-crash-7582b9a9b1f37e4af199f2a98c4bb287e0a811ce", FIF_TIFF, 0, DecodeAny, false},
+	{"CVE-2025-70968-id_000004_00", "POCFiles/CVE-2025-70968.tga", FIF_TARGA, 0, RejectImage, false},
+	{"CVE-2025-65803", "POCFiles/CVE-2025-65803.psb", FIF_PSD, 0, DisabledCodec, false},
+	// CVE-2019-12214 - OpenJPEG packed-packet-header (PPM, JPEG2000 marker 0xFF60)
+	// out-of-bounds. All fixtures are reconstructed from this fork's own decoder-
+	// accepted 128x128 24-bit FIF_J2K codestream (POCFiles/CVE-2019-12214-base.j2k,
+	// read by TestAPI/POCFiles/gen_cve_2019_12214.py to derive variants) with a PPM marker
+	// spliced in just before SOT, so the main-header loop reaches
+	// opj_j2k_merge_ppm (Source/LibOpenJPEG/j2k.c:3989). The historical
+	// j2k_read_ppm_v3 was replaced by opj_j2k_read_ppm/merge_ppm in OpenJPEG
+	// refactor c887df12; merge_ppm carries the Nppm-field, accumulator, and
+	// unfinished-series guards. The three malformed groups are pinned RejectImage
+	// and, per entry point, assert the exact opj_j2k_merge_ppm guard text
+	// (A1/A2/A3: "Not enough bytes to read Nppm", j2k.c:4023; C1/C2/C3/B1:
+	// "Corrupted PPM markers", j2k.c:4049) so an early, unrelated rejection is
+	// gated out. The two complete/split series (V1/V2) are pinned DecodeRequired:
+	// they decode through file and memory with pixels and dimensions, so a
+	// regression that rejects every FIF_J2K fails them; the *absence* of a guard
+	// for V1/V2 is reported informationally (no listed guard diagnostic captured,
+	// not proof that the merge ran). The no-PPM baseline is the reference decode.
+	{ "CVE-2019-12214-base",      "POCFiles/CVE-2019-12214-base.j2k",       FIF_J2K, 0, DecodeRequired, false },
+	{ "CVE-2019-12214-A1-nppm-trunc",    "POCFiles/CVE-2019-12214-A1-nppm-trunc.j2k",    FIF_J2K, 0, RejectImage, false },
+	{ "CVE-2019-12214-A2-nppm-trunc",    "POCFiles/CVE-2019-12214-A2-nppm-trunc.j2k",    FIF_J2K, 0, RejectImage, false },
+	{ "CVE-2019-12214-A3-nppm-trunc",    "POCFiles/CVE-2019-12214-A3-nppm-trunc.j2k",    FIF_J2K, 0, RejectImage, false },
+	{ "CVE-2019-12214-C1-unfinished",    "POCFiles/CVE-2019-12214-C1-unfinished.j2k",    FIF_J2K, 0, RejectImage, false },
+	{ "CVE-2019-12214-C2-unfinished",    "POCFiles/CVE-2019-12214-C2-unfinished.j2k",    FIF_J2K, 0, RejectImage, false },
+	{ "CVE-2019-12214-C3-unfinished2",   "POCFiles/CVE-2019-12214-C3-unfinished2.j2k",   FIF_J2K, 0, RejectImage, false },
+	{ "CVE-2019-12214-B1-oversized",     "POCFiles/CVE-2019-12214-B1-oversized.j2k",     FIF_J2K, 0, RejectImage, false },
+	{ "CVE-2019-12214-V1-complete",      "POCFiles/CVE-2019-12214-V1-complete.j2k",      FIF_J2K, 0, DecodeRequired, false },
+	{ "CVE-2019-12214-V2-split",         "POCFiles/CVE-2019-12214-V2-split.j2k",         FIF_J2K, 0, DecodeRequired, false },
+	// CVE-2021-33367 - off-by-four in the shared EXIF parser's 1st-IFD (thumbnail)
+	// next-IFD read. source/Metadata/Exif.cpp:839 (was :775) checks that the *start* of the
+	// 4-byte next-IFD field lies within the profile, but line 856 (was 792) consumes all four
+	// bytes via ReadUint32. When the 0th IFD is complete and only 0-3 of those 4
+	// bytes remain at the end of the profile, the read runs 1-4 bytes past the copy
+	// the loader passed in. The reported JXR path reaches the same shared function via
+	// jpegxr_read_exif_gps_profile, but no end-to-end JXR trigger was demonstrated:
+	// JXR's StreamCalcIFDSize (JXRMeta.c:249, unchecked size arithmetic plus a
+	// recursive sub-IFD sum) is not safety on its own, so JXR is not claimed safe.
+	// The identical off-by-four is exercised end-to-end through JPEG App1/Exif
+	// (FreeImage_Load -> jpeg_read_exif_profile -> jpeg_read_exif_dir), which is the
+	// attacker-controlled-length path. Five reconstructed fixtures
+	// (POCFiles/gen_cve_2021_33367.py, byte-deterministic) share one decoded pixel
+	// body and differ only in how many of the next-IFD bytes survive:
+	//   control : all 4 next-IFD bytes present (a zero thumbnail offset) -> must
+	//             still decode to 600x400, proving the guard is a narrow boundary fix,
+	//             not a blanket rejection.
+	//   trunc0-3: 0,1,2,3 next-IFD bytes remain -> the +4 guard must reject (throw
+	//             "Invalid next IFD offset", caught by the JPEG loader into a clean
+	//             null return). On the unfixed parser these still decode, with the
+	//             read running 1-4 bytes past the profile end.
+	{ "CVE-2021-33367-control", "POCFiles/CVE-2021-33367-control.jpg", FIF_JPEG, 0, DecodeRequired, false },
+	{ "CVE-2021-33367-trunc0",  "POCFiles/CVE-2021-33367-trunc0.jpg",  FIF_JPEG, 0, RejectImage, false },
+	{ "CVE-2021-33367-trunc1",  "POCFiles/CVE-2021-33367-trunc1.jpg",  FIF_JPEG, 0, RejectImage, false },
+	{ "CVE-2021-33367-trunc2",  "POCFiles/CVE-2021-33367-trunc2.jpg",  FIF_JPEG, 0, RejectImage, false },
+	{ "CVE-2021-33367-trunc3",  "POCFiles/CVE-2021-33367-trunc3.jpg",  FIF_JPEG, 0, RejectImage, false },
+	// CVE-2020-24293 - retained psdThumbnail::Read, reached through the TIFF
+	// Photoshop tag (TIFFTAG_PHOTOSHOP 34377 -> PluginTIFF.cpp ReadThumbnail ->
+	// psdParser::ReadImageResources -> resource 1036/1033). PSD decoding is
+	// removed, so the PSD-container cases above cannot reach this reader. Each
+	// input is generated in the worker: a valid 2x2 8-bit uncompressed TIFF
+	// whose Photoshop block carries one thumbnail resource. Every variant must
+	// decode the 2x2 main image on both entry points (a malformed resource must
+	// not cost the caller the main image); the two controls must also attach
+	// the exact thumbnail, and every malformed variant must attach none.
+	{ "CVE-2020-24293-tiff-thumb-raw-ok",            SYNTHETIC_FIXTURE, FIF_TIFF, 0, DecodeRequired, true, runTIFFPhotoshopThumbnailCase, PSDT_RAW_OK },
+	{ "CVE-2020-24293-tiff-thumb-jpeg-ok",           SYNTHETIC_FIXTURE, FIF_TIFF, 0, DecodeRequired, true, runTIFFPhotoshopThumbnailCase, PSDT_JPEG_OK },
+	{ "CVE-2020-24293-tiff-thumb-rowbytes",          SYNTHETIC_FIXTURE, FIF_TIFF, 0, DecodeRequired, true, runTIFFPhotoshopThumbnailCase, PSDT_ROWBYTES },
+	{ "CVE-2020-24293-tiff-thumb-bpp",               SYNTHETIC_FIXTURE, FIF_TIFF, 0, DecodeRequired, true, runTIFFPhotoshopThumbnailCase, PSDT_BPP },
+	{ "CVE-2020-24293-tiff-thumb-height-neg",        SYNTHETIC_FIXTURE, FIF_TIFF, 0, DecodeRequired, true, runTIFFPhotoshopThumbnailCase, PSDT_HEIGHT_NEG },
+	{ "CVE-2020-24293-tiff-thumb-width-zero",        SYNTHETIC_FIXTURE, FIF_TIFF, 0, DecodeRequired, true, runTIFFPhotoshopThumbnailCase, PSDT_WIDTH_ZERO },
+	{ "CVE-2020-24293-tiff-thumb-truncated",         SYNTHETIC_FIXTURE, FIF_TIFF, 0, DecodeRequired, true, runTIFFPhotoshopThumbnailCase, PSDT_TRUNCATED },
+	{ "CVE-2020-24293-tiff-thumb-short-resource",    SYNTHETIC_FIXTURE, FIF_TIFF, 0, DecodeRequired, true, runTIFFPhotoshopThumbnailCase, PSDT_SHORT_RESOURCE },
+	{ "CVE-2020-24293-tiff-thumb-oversize-resource", SYNTHETIC_FIXTURE, FIF_TIFF, 0, DecodeRequired, true, runTIFFPhotoshopThumbnailCase, PSDT_OVERSIZE_RESOURCE },
+	{ "CVE-2020-24293-tiff-thumb-format-unknown",    SYNTHETIC_FIXTURE, FIF_TIFF, 0, DecodeRequired, true, runTIFFPhotoshopThumbnailCase, PSDT_FORMAT_UNKNOWN },
+	{ "CVE-2020-24293-tiff-thumb-jpeg-garbage",      SYNTHETIC_FIXTURE, FIF_TIFF, 0, DecodeRequired, true, runTIFFPhotoshopThumbnailCase, PSDT_JPEG_GARBAGE },
+	{ "CVE-2020-24293-tiff-thumb-displayinfo-throw", SYNTHETIC_FIXTURE, FIF_TIFF, 0, DecodeRequired, true, runTIFFPhotoshopThumbnailCase, PSDT_DISPLAYINFO_THROW },
+	// Odd-length boundary: resource data is padded to an even length, but the
+	// pad byte is not payload. odd-raw-ok is a valid odd-length (37-byte) raw
+	// thumbnail preceded by an odd 1-byte resource, so it only attaches if the
+	// stream advances over each pad byte. odd-pad-completes-row declares one
+	// byte fewer than the rows need; only the pad byte could complete them.
+	{ "CVE-2020-24293-tiff-thumb-odd-raw-ok",        SYNTHETIC_FIXTURE, FIF_TIFF, 0, DecodeRequired, true, runTIFFPhotoshopThumbnailCase, PSDT_ODD_RAW_OK },
+	{ "CVE-2020-24293-tiff-thumb-odd-pad-completes-row", SYNTHETIC_FIXTURE, FIF_TIFF, 0, DecodeRequired, true, runTIFFPhotoshopThumbnailCase, PSDT_ODD_PAD_COMPLETES_ROW },
+	// Shared EXIF directory parser (Source/Metadata/Exif.cpp jpeg_read_exif_dir
+	// and its JPEG/WebP/PSD entry points), hardened beyond the 0th-IFD
+	// next-IFD guard of CVE-2021-33367. Not a single published CVE: these pin
+	// the bounds checks for each directory-walk read. Inputs are generated JPEGs
+	// whose APP1/Exif carries the variant. All must decode the 16x8 main image on
+	// both entry points; the control must also expose its Make/ISO tags and
+	// 8x4 thumbnail, and each malformed variant asserts which metadata must be
+	// absent (a tag read from out-of-profile bytes must not be stored).
+	{ "HARDEN-EXIF-control",                  SYNTHETIC_FIXTURE, FIF_JPEG, 0, DecodeRequired, true, runExifDirectoryCase, EXIF_CONTROL },
+	{ "HARDEN-EXIF-ifd0-at-end",              SYNTHETIC_FIXTURE, FIF_JPEG, 0, DecodeRequired, true, runExifDirectoryCase, EXIF_IFD0_AT_END },
+	{ "HARDEN-EXIF-ifd0-straddle",            SYNTHETIC_FIXTURE, FIF_JPEG, 0, DecodeRequired, true, runExifDirectoryCase, EXIF_IFD0_STRADDLE },
+	{ "HARDEN-EXIF-subifd-count-at-end",      SYNTHETIC_FIXTURE, FIF_JPEG, 0, DecodeRequired, true, runExifDirectoryCase, EXIF_SUBIFD_COUNT_AT_END },
+	{ "HARDEN-EXIF-subifd-entry-straddle",    SYNTHETIC_FIXTURE, FIF_JPEG, 0, DecodeRequired, true, runExifDirectoryCase, EXIF_SUBIFD_ENTRY_STRADDLE },
+	{ "HARDEN-EXIF-makernote-outside",        SYNTHETIC_FIXTURE, FIF_JPEG, 0, DecodeRequired, true, runExifDirectoryCase, EXIF_MAKERNOTE_OUTSIDE },
+	{ "HARDEN-EXIF-makernote-short-signature", SYNTHETIC_FIXTURE, FIF_JPEG, 0, DecodeRequired, true, runExifDirectoryCase, EXIF_MAKERNOTE_SHORT_SIGNATURE },
+	{ "HARDEN-EXIF-canon-subtag-width",       SYNTHETIC_FIXTURE, FIF_JPEG, 0, DecodeRequired, true, runExifDirectoryCase, EXIF_CANON_SUBTAG_WIDTH },
+	{ "HARDEN-EXIF-ifd1-count-at-end",        SYNTHETIC_FIXTURE, FIF_JPEG, 0, DecodeRequired, true, runExifDirectoryCase, EXIF_IFD1_COUNT_AT_END },
+	{ "HARDEN-EXIF-app1-short-header",        SYNTHETIC_FIXTURE, FIF_JPEG, 0, DecodeRequired, true, runExifDirectoryCase, EXIF_APP1_SHORT_HEADER },
+	{ "HARDEN-EXIF-app1-tiny",                SYNTHETIC_FIXTURE, FIF_JPEG, 0, DecodeRequired, true, runExifDirectoryCase, EXIF_APP1_TINY },
+	// HDR dimension line (PluginHDR.cpp rgbe_ParseSize, the strtol-based
+	// replacement for sscanf("%d")). Valid-input controls pin that well-formed
+	// size lines still decode to exact dimensions and pixels (flat and RLE
+	// scanlines, both supported orientations, whitespace, the 1x1 minimum, and
+	// header-only mode); malformed lines must be rejected by the parser itself,
+	// asserted per entry point via its "invalid image size specifier" text.
+	{ "HARDEN-HDR-flat-ok",           SYNTHETIC_FIXTURE, FIF_HDR, 0, DecodeRequired, true, runHDRDimensionCase, HDR_FLAT_OK },
+	{ "HARDEN-HDR-rle-roundtrip-ok",  SYNTHETIC_FIXTURE, FIF_HDR, 0, DecodeRequired, true, runHDRDimensionCase, HDR_RLE_ROUNDTRIP_OK },
+	{ "HARDEN-HDR-plus-x-ok",         SYNTHETIC_FIXTURE, FIF_HDR, 0, DecodeRequired, true, runHDRDimensionCase, HDR_PLUS_X_OK },
+	{ "HARDEN-HDR-whitespace-ok",     SYNTHETIC_FIXTURE, FIF_HDR, 0, DecodeRequired, true, runHDRDimensionCase, HDR_WHITESPACE_OK },
+	{ "HARDEN-HDR-1x1-ok",            SYNTHETIC_FIXTURE, FIF_HDR, 0, DecodeRequired, true, runHDRDimensionCase, HDR_ONE_BY_ONE_OK },
+	{ "HARDEN-HDR-zero-height",       SYNTHETIC_FIXTURE, FIF_HDR, 0, RejectImage, true, runHDRDimensionCase, HDR_ZERO_HEIGHT },
+	{ "HARDEN-HDR-zero-width",        SYNTHETIC_FIXTURE, FIF_HDR, 0, RejectImage, true, runHDRDimensionCase, HDR_ZERO_WIDTH },
+	{ "HARDEN-HDR-negative",          SYNTHETIC_FIXTURE, FIF_HDR, 0, RejectImage, true, runHDRDimensionCase, HDR_NEGATIVE },
+	{ "HARDEN-HDR-above-int-max",     SYNTHETIC_FIXTURE, FIF_HDR, 0, RejectImage, true, runHDRDimensionCase, HDR_ABOVE_INT_MAX },
+	{ "HARDEN-HDR-erange",            SYNTHETIC_FIXTURE, FIF_HDR, 0, RejectImage, true, runHDRDimensionCase, HDR_ERANGE },
+	{ "HARDEN-HDR-missing-value",     SYNTHETIC_FIXTURE, FIF_HDR, 0, RejectImage, true, runHDRDimensionCase, HDR_MISSING_VALUE },
+	{ "HARDEN-HDR-missing-tag",       SYNTHETIC_FIXTURE, FIF_HDR, 0, RejectImage, true, runHDRDimensionCase, HDR_MISSING_TAG },
+	{ "HARDEN-HDR-non-numeric",       SYNTHETIC_FIXTURE, FIF_HDR, 0, RejectImage, true, runHDRDimensionCase, HDR_NON_NUMERIC },
+	{ "HARDEN-HDR-truncated-pixels",  SYNTHETIC_FIXTURE, FIF_HDR, 0, RejectImage, true, runHDRDimensionCase, HDR_TRUNCATED_PIXELS },
+	// Legacy codecs switched off at initialisation (Plugin.cpp, DisableLegacyCodecs).
+	{ "HARDEN-LEGACY-KOALA", SYNTHETIC_FIXTURE, FIF_KOALA, 0, DisabledCodec, false, runLegacyCodecDisabledCase, 0 },
+	{ "HARDEN-LEGACY-IFF",   SYNTHETIC_FIXTURE, FIF_LBM,   0, DisabledCodec, false, runLegacyCodecDisabledCase, 0 },
+	{ "HARDEN-LEGACY-MNG",   SYNTHETIC_FIXTURE, FIF_MNG,   0, DisabledCodec, false, runLegacyCodecDisabledCase, 0 },
+	{ "HARDEN-LEGACY-PCD",   SYNTHETIC_FIXTURE, FIF_PCD,   0, DisabledCodec, false, runLegacyCodecDisabledCase, 0 },
+	{ "HARDEN-LEGACY-CUT",   SYNTHETIC_FIXTURE, FIF_CUT,   0, DisabledCodec, false, runLegacyCodecDisabledCase, 0 },
+	{ "HARDEN-LEGACY-G3",    SYNTHETIC_FIXTURE, FIF_FAXG3, 0, DisabledCodec, false, runLegacyCodecDisabledCase, 0 },
+	{ "HARDEN-LEGACY-SGI",   SYNTHETIC_FIXTURE, FIF_SGI,   0, DisabledCodec, false, runLegacyCodecDisabledCase, 0 },
+	{ "HARDEN-LEGACY-PICT",  SYNTHETIC_FIXTURE, FIF_PICT,  0, DisabledCodec, false, runLegacyCodecDisabledCase, 0 },
+	{ "HARDEN-LEGACY-PBM", SYNTHETIC_FIXTURE, FIF_PBM, 0, DisabledCodec, false, runLegacyCodecDisabledCase, 0 },
+	{ "HARDEN-LEGACY-PBMRAW", SYNTHETIC_FIXTURE, FIF_PBMRAW, 0, DisabledCodec, false, runLegacyCodecDisabledCase, 0 },
+	{ "HARDEN-LEGACY-PGM", SYNTHETIC_FIXTURE, FIF_PGM, 0, DisabledCodec, false, runLegacyCodecDisabledCase, 0 },
+	{ "HARDEN-LEGACY-PGMRAW", SYNTHETIC_FIXTURE, FIF_PGMRAW, 0, DisabledCodec, false, runLegacyCodecDisabledCase, 0 },
+	{ "HARDEN-LEGACY-PPM", SYNTHETIC_FIXTURE, FIF_PPM, 0, DisabledCodec, false, runLegacyCodecDisabledCase, 0 },
+	{ "HARDEN-LEGACY-PPMRAW", SYNTHETIC_FIXTURE, FIF_PPMRAW, 0, DisabledCodec, false, runLegacyCodecDisabledCase, 0 },
+	{ "HARDEN-LEGACY-PFM", SYNTHETIC_FIXTURE, FIF_PFM, 0, DisabledCodec, false, runLegacyCodecDisabledCase, 0 },
+	{ "HARDEN-LEGACY-PCX", SYNTHETIC_FIXTURE, FIF_PCX, 0, DisabledCodec, false, runLegacyCodecDisabledCase, 0 },
+	{ "HARDEN-LEGACY-DDS", SYNTHETIC_FIXTURE, FIF_DDS, 0, DisabledCodec, false, runLegacyCodecDisabledCase, 0 },
+	{ "HARDEN-LEGACY-ICO", SYNTHETIC_FIXTURE, FIF_ICO, 0, DisabledCodec, false, runLegacyCodecDisabledCase, 0 },
+	// Format round-trip / decode validation (testFormats.cpp). Not CVEs: these
+	// pin that the codecs used by the product decode valid input and that every
+	// writer round-trips through FreeImage_Load and FreeImage_LoadFromMemory
+	// with exact (lossless) or bounded (lossy) pixel error, autodetection on
+	// both entry points, identical file/memory writer output and header-only
+	// layout. Inputs are generated in the worker.
+	{ "FORMAT-EXR-rgbf-half",        SYNTHETIC_FIXTURE, FIF_EXR,   0, DecodeRequired, true, runFormatCase, FMT_EXR_RGBF_HALF },
+	{ "FORMAT-EXR-rgbf-float",       SYNTHETIC_FIXTURE, FIF_EXR,   0, DecodeRequired, true, runFormatCase, FMT_EXR_RGBF_FLOAT },
+	{ "FORMAT-EXR-rgbaf",            SYNTHETIC_FIXTURE, FIF_EXR,   0, DecodeRequired, true, runFormatCase, FMT_EXR_RGBAF },
+	{ "FORMAT-EXR-float-y",          SYNTHETIC_FIXTURE, FIF_EXR,   0, DecodeRequired, true, runFormatCase, FMT_EXR_FLOAT_Y },
+	{ "FORMAT-EXR-lossy",            SYNTHETIC_FIXTURE, FIF_EXR,   0, DecodeRequired, true, runFormatCase, FMT_EXR_LOSSY },
+	{ "FORMAT-EXR-invalid",          SYNTHETIC_FIXTURE, FIF_EXR,   0, RejectImage,    true, runFormatCase, FMT_EXR_INVALID },
+	{ "FORMAT-RAW-dng-modes",        SYNTHETIC_FIXTURE, FIF_RAW,   0, DecodeRequired, true, runFormatCase, FMT_RAW_DNG_MODES },
+	{ "FORMAT-RAW-dng-malformed",    SYNTHETIC_FIXTURE, FIF_RAW,   0, DecodeOrReject, true, runFormatCase, FMT_RAW_DNG_MALFORMED },
+	{ "FORMAT-J2K-lossless-8bit",    SYNTHETIC_FIXTURE, FIF_J2K,   0, DecodeRequired, true, runFormatCase, FMT_J2K_LOSSLESS_8BIT },
+	{ "FORMAT-J2K-lossless-16bit",   SYNTHETIC_FIXTURE, FIF_J2K,   0, DecodeRequired, true, runFormatCase, FMT_J2K_LOSSLESS_16BIT },
+	{ "FORMAT-J2K-lossy",            SYNTHETIC_FIXTURE, FIF_J2K,   0, DecodeRequired, true, runFormatCase, FMT_J2K_LOSSY },
+	{ "FORMAT-J2K-invalid",          SYNTHETIC_FIXTURE, FIF_J2K,   0, DecodeOrReject, true, runFormatCase, FMT_J2K_INVALID },
+	{ "FORMAT-TGA-truecolor",        SYNTHETIC_FIXTURE, FIF_TARGA, 0, DecodeRequired, true, runFormatCase, FMT_TGA_TRUECOLOR },
+	{ "FORMAT-TGA-palette",          SYNTHETIC_FIXTURE, FIF_TARGA, 0, DecodeRequired, true, runFormatCase, FMT_TGA_PALETTE },
+	{ "FORMAT-TGA-16bit-to-24",      SYNTHETIC_FIXTURE, FIF_TARGA, 0, DecodeRequired, true, runFormatCase, FMT_TGA_16BIT_TO_24 },
+	{ "FORMAT-BMP-palette",          SYNTHETIC_FIXTURE, FIF_BMP,   0, DecodeRequired, true, runFormatCase, FMT_BMP_PALETTE },
+	{ "FORMAT-BMP-truecolor",        SYNTHETIC_FIXTURE, FIF_BMP,   0, DecodeRequired, true, runFormatCase, FMT_BMP_TRUECOLOR },
+	{ "FORMAT-PNG-palette",          SYNTHETIC_FIXTURE, FIF_PNG,   0, DecodeRequired, true, runFormatCase, FMT_PNG_PALETTE },
+	{ "FORMAT-PNG-truecolor",        SYNTHETIC_FIXTURE, FIF_PNG,   0, DecodeRequired, true, runFormatCase, FMT_PNG_TRUECOLOR },
+	{ "FORMAT-PNG-16bit",            SYNTHETIC_FIXTURE, FIF_PNG,   0, DecodeRequired, true, runFormatCase, FMT_PNG_16BIT },
+	{ "FORMAT-TIFF-multipage-file",   SYNTHETIC_FIXTURE, FIF_TIFF,  0, DecodeRequired, true, runFormatCase, FMT_TIFF_MULTIPAGE_FILE },
+	{ "FORMAT-TIFF-multipage-memory", SYNTHETIC_FIXTURE, FIF_TIFF,  0, DecodeRequired, true, runFormatCase, FMT_TIFF_MULTIPAGE_MEMORY },
+	{ "FORMAT-TIFF-multipage-edit",   SYNTHETIC_FIXTURE, FIF_TIFF,  0, DecodeRequired, true, runFormatCase, FMT_TIFF_MULTIPAGE_EDIT },
+	{ "FORMAT-TIFF-lossless",         SYNTHETIC_FIXTURE, FIF_TIFF,  0, DecodeRequired, true, runFormatCase, FMT_TIFF_LOSSLESS },
+	{ "FORMAT-TIFF-bilevel",          SYNTHETIC_FIXTURE, FIF_TIFF,  0, DecodeRequired, true, runFormatCase, FMT_TIFF_BILEVEL },
+	{ "FORMAT-TIFF-lossy",            SYNTHETIC_FIXTURE, FIF_TIFF,  0, DecodeRequired, true, runFormatCase, FMT_TIFF_LOSSY },
+	{ "FORMAT-TIFF-tiled",            SYNTHETIC_FIXTURE, FIF_TIFF,  0, DecodeRequired, true, runFormatCase, FMT_TIFF_TILED },
+	{ "FORMAT-TIFF-planar",           SYNTHETIC_FIXTURE, FIF_TIFF,  0, DecodeRequired, true, runFormatCase, FMT_TIFF_PLANAR },
+	{ "FORMAT-TIFF-iptc",             SYNTHETIC_FIXTURE, FIF_TIFF,  0, DecodeRequired, true, runFormatCase, FMT_TIFF_IPTC },
+	// LibTIFF 4 tag-convention audit: fixed-count ASCII tags, IFD0 tags set
+	// without a count, GeoTIFF uint16 counts, 32-bit directory numbers.
+	{ "FORMAT-TIFF-exif-ascii",       SYNTHETIC_FIXTURE, FIF_TIFF,  0, DecodeRequired, true, runFormatCase, FMT_TIFF_EXIF_ASCII },
+	{ "FORMAT-TIFF-exif-write",       SYNTHETIC_FIXTURE, FIF_TIFF,  0, DecodeRequired, true, runFormatCase, FMT_TIFF_EXIF_WRITE },
+	{ "FORMAT-TIFF-geotiff-count",    SYNTHETIC_FIXTURE, FIF_TIFF,  0, DecodeRequired, true, runFormatCase, FMT_TIFF_GEOTIFF_COUNT },
+	{ "FORMAT-TIFF-page-index",       SYNTHETIC_FIXTURE, FIF_TIFF,  0, DecodeRequired, true, runFormatCase, FMT_TIFF_PAGE_INDEX },
+	{ "FORMAT-GIF",                   SYNTHETIC_FIXTURE, FIF_GIF,   0, DecodeRequired, true, runFormatCase, FMT_GIF_SINGLE },
+	{ "FORMAT-GIF-multipage",         SYNTHETIC_FIXTURE, FIF_GIF,   0, DecodeRequired, true, runFormatCase, FMT_GIF_MULTIPAGE },
+	{ "FORMAT-JP2",                   SYNTHETIC_FIXTURE, FIF_JP2,   0, DecodeRequired, true, runFormatCase, FMT_JP2 },
+	{ "FORMAT-JNG",                   SYNTHETIC_FIXTURE, FIF_JNG,   0, DecodeRequired, true, runFormatCase, FMT_JNG },
+	{ "FORMAT-JXR-lossless",          SYNTHETIC_FIXTURE, FIF_JXR,   0, DecodeRequired, true, runFormatCase, FMT_JXR_LOSSLESS },
+	{ "FORMAT-JXR-lossy",             SYNTHETIC_FIXTURE, FIF_JXR,   0, DecodeRequired, true, runFormatCase, FMT_JXR_LOSSY },
+	{ "FORMAT-WBMP",                  SYNTHETIC_FIXTURE, FIF_WBMP,  0, DecodeRequired, true, runFormatCase, FMT_WBMP },
+	// Real-world sample: realworld-pentax-k20d.jpg (not distributed).
+	{ "FORMAT-JPEG-realworld",        SYNTHETIC_FIXTURE, FIF_JPEG,  0, DecodeRequired, true, runFormatCase, FMT_JPEG_REALWORLD },
+	// Real-world sample: realworld-canon-eos20d.cr2 (not distributed).
+	{ "FORMAT-RAW-cr2-metadata",      SYNTHETIC_FIXTURE, FIF_RAW,   0, DecodeRequired, true, runFormatCase, FMT_RAW_CR2_METADATA },
+	{ "FORMAT-RAW-cr2-unprocessed",   SYNTHETIC_FIXTURE, FIF_RAW,   0, DecodeRequired, true, runFormatCase, FMT_RAW_CR2_UNPROCESSED },
+	{ "FORMAT-RAW-cr2-processed",     SYNTHETIC_FIXTURE, FIF_RAW,   0, DecodeRequired, true, runFormatCase, FMT_RAW_CR2_PROCESSED },
+	{ "FORMAT-RAW-cr2-processed-2",   SYNTHETIC_FIXTURE, FIF_RAW,   0, DecodeRequired, true, runFormatCase, FMT_RAW_CR2_PROCESSED_MORE },
+	// FreeImage_Rotate / FreeImage_RotateEx (testRotate.cpp). Not CVEs: the
+	// three-shear code (ClassicRotate.cpp) had no test, and MSVC reported
+	// C4789 overruns of its per-pixel stack buffers. Each supported type is
+	// rotated by exact quarter turns (pixel-checked) and by arbitrary angles
+	// with a background colour held in an exact-size heap block, so ASan sees
+	// any over-read. Unsupported types must be refused; non-finite angles must
+	// be refused and huge angles reduced instead of looping.
+	{ "ROTATE-grey8",        SYNTHETIC_FIXTURE, FIF_BMP, 0, DecodeRequired, true, runRotateCase, ROT_GREY8 },
+	{ "ROTATE-palette8",     SYNTHETIC_FIXTURE, FIF_BMP, 0, DecodeRequired, true, runRotateCase, ROT_PALETTE8 },
+	{ "ROTATE-rgb24",        SYNTHETIC_FIXTURE, FIF_BMP, 0, DecodeRequired, true, runRotateCase, ROT_RGB24 },
+	{ "ROTATE-rgba32",       SYNTHETIC_FIXTURE, FIF_BMP, 0, DecodeRequired, true, runRotateCase, ROT_RGBA32 },
+	{ "ROTATE-uint16",       SYNTHETIC_FIXTURE, FIF_BMP, 0, DecodeRequired, true, runRotateCase, ROT_UINT16 },
+	{ "ROTATE-rgb16",        SYNTHETIC_FIXTURE, FIF_BMP, 0, DecodeRequired, true, runRotateCase, ROT_RGB16 },
+	{ "ROTATE-rgba16",       SYNTHETIC_FIXTURE, FIF_BMP, 0, DecodeRequired, true, runRotateCase, ROT_RGBA16 },
+	{ "ROTATE-float",        SYNTHETIC_FIXTURE, FIF_BMP, 0, DecodeRequired, true, runRotateCase, ROT_FLOAT },
+	{ "ROTATE-rgbf",         SYNTHETIC_FIXTURE, FIF_BMP, 0, DecodeRequired, true, runRotateCase, ROT_RGBF },
+	{ "ROTATE-rgbaf",        SYNTHETIC_FIXTURE, FIF_BMP, 0, DecodeRequired, true, runRotateCase, ROT_RGBAF },
+	{ "ROTATE-bilevel",      SYNTHETIC_FIXTURE, FIF_BMP, 0, DecodeRequired, true, runRotateCase, ROT_BILEVEL },
+	{ "ROTATE-unsupported",  SYNTHETIC_FIXTURE, FIF_BMP, 0, RejectImage,    true, runRotateCase, ROT_UNSUPPORTED },
+	{ "ROTATE-angle-limits", SYNTHETIC_FIXTURE, FIF_BMP, 0, DecodeRequired, true, runRotateCase, ROT_ANGLE_LIMITS },
+	{ "ROTATE-ex",           SYNTHETIC_FIXTURE, FIF_BMP, 0, DecodeRequired, true, runRotateCase, ROT_EX },
+	// FreeImage_RotateEx with shifts of whole mirror periods (up to 1e300
+	// periods) must match the unshifted image; non-finite parameters must be
+	// refused. Large shifts overflowed the 32-bit spline index arithmetic.
+	{ "ROTATE-ex-coordinates", SYNTHETIC_FIXTURE, FIF_BMP, 0, DecodeRequired, true, runRotateCase, ROT_EX_COORDINATES }
+};
+
+static const CVECase *findCVECase(const char *id) {
+	for (size_t index = 0; index < sizeof(cveCases) / sizeof(cveCases[0]); ++index) {
+		if (strcmp(id, cveCases[index].id) == 0) return &cveCases[index];
+	}
+	return NULL;
+}
+
+static std::string fixturePath(const CVECase &test, const char *root) {
+	return std::string(root) + "/" + test.fixture;
+}
+
+static bool checkCVEPrerequisites(const CVECase &test, const char *root) {
+	if (test.synthetic) {
+		// Generated in the worker: only the decoder has to be available
+		// (a DisabledCodec case asserts its absence itself).
+		if (test.expectation != DisabledCodec
+			&& (!FreeImage_IsPluginEnabled(test.format) || !FreeImage_FIFSupportsReading(test.format))) {
+			printf("[FAIL] %s: required decoder is disabled or unavailable\n", test.id);
+			return false;
+		}
+		return true;
+	}
+	const std::string path = fixturePath(test, root);
+	FILE *input = fopen(path.c_str(), "rb");
+	if (!input) {
+		printf("[FAIL] %s: fixture cannot be opened: %s\n", test.id, path.c_str());
+		return false;
+	}
+	const bool hasData = fgetc(input) != EOF;
+	const bool seekOK = fseek(input, 0, SEEK_END) == 0;
+	const long length = seekOK ? ftell(input) : -1;
+	fclose(input);
+	if (!hasData || length <= 0 || length > 16 * 1024 * 1024) {
+		printf("[FAIL] %s: fixture must be readable and contain 1 to 16777216 bytes\n", test.id);
+		return false;
+	}
+	if (test.expectation == DisabledCodec) {
+		FreeImage_SetPluginEnabled(test.format, TRUE);
+		if (FreeImage_FIFSupportsReading(test.format) || FreeImage_FIFSupportsWriting(test.format)
+			|| FreeImage_FIFSupportsICCProfiles(test.format) || FreeImage_FIFSupportsNoPixels(test.format)) {
+			printf("[FAIL] %s: removed codec advertises supported capabilities\n", test.id);
+			return false;
+		}
+		for (int depth = 1; depth <= 128; ++depth) {
+			if (FreeImage_FIFSupportsExportBPP(test.format, depth)) return false;
+		}
+		for (int type = FIT_BITMAP; type <= FIT_RGBAF; ++type) {
+			if (FreeImage_FIFSupportsExportType(test.format, (FREE_IMAGE_TYPE)type)) return false;
+		}
+		return true;
+	}
+	if (!FreeImage_IsPluginEnabled(test.format) || !FreeImage_FIFSupportsReading(test.format)) {
+		printf("[FAIL] %s: required decoder is disabled or unavailable\n", test.id);
+		return false;
+	}
+	return true;
+}
+
+static bool checkCVEBitmap(const CVECase &test, FIBITMAP *bitmap, const char *entryPoint);
+
+static bool checkPCXControlPixels(const char *id, FIBITMAP *bitmap, const char *entryPoint) {
+	// CVE-2015-0852 ok control is a complete 2x2 24-bit image. A decode must
+	// materialise every pixel; assert the exact values produced by the PCX
+	// decoder for the file gen_cve_2015_0852.py wrote. A null bitmap is a
+	// genuine failure here, so the control cannot be satisfied by a codec-wide
+	// regression that rejects every PCX.
+	//
+	// The generator lays the image out top-to-bottom, but the decoder writes the
+	// first scanline at the bottom (bits = height-1, then bits -= pitch), so the
+	// FreeImage Y axis is the generator's Y axis flipped.
+	static const struct {
+		unsigned x, y; BYTE r, g, b;
+	} expected[] = {
+		{0, 0, 0x40, 0x50, 0xB0},
+		{1, 0, 0x60, 0x70, 0xD0},
+		{0, 1, 0xC0, 0x10, 0x80},
+		{1, 1, 0x20, 0x30, 0xA0}
+	};
+	if (!bitmap || !FreeImage_HasPixels(bitmap)
+		|| FreeImage_GetWidth(bitmap) != 2 || FreeImage_GetHeight(bitmap) != 2
+		|| FreeImage_GetBPP(bitmap) != 24) {
+		printf("[FAIL] %s: %s control did not decode to a 2x2 24-bit bitmap\n", id, entryPoint);
+		FreeImage_Unload(bitmap);
+		return false;
+	}
+	for (size_t index = 0; index < sizeof(expected) / sizeof(expected[0]); ++index) {
+		RGBQUAD color;
+		if (!FreeImage_GetPixelColor(bitmap, expected[index].x, expected[index].y, &color)) {
+			printf("[FAIL] %s: cannot read pixel %u,%u\n", id, expected[index].x, expected[index].y);
+			FreeImage_Unload(bitmap);
+			return false;
+		}
+		if (color.rgbRed != expected[index].r || color.rgbGreen != expected[index].g
+			|| color.rgbBlue != expected[index].b) {
+			printf("[FAIL] %s: pixel %u,%u = %02x/%02x/%02x, expected %02x/%02x/%02x\n",
+				id, expected[index].x, expected[index].y,
+				color.rgbRed, color.rgbGreen, color.rgbBlue,
+				expected[index].r, expected[index].g, expected[index].b);
+			FreeImage_Unload(bitmap);
+			return false;
+		}
+	}
+	FreeImage_Unload(bitmap);
+	printf("%s: %s decoded 2x2 control and matches expected pixels\n", id, entryPoint);
+	return true;
+}
+
+// CVE-2019-12214 decode control. Used for the no-PPM baseline (where
+// opj_j2k_merge_ppm is a no-op, ppm==0) and for the V1/V2 complete/split-series
+// controls (where a PPM marker is present and a complete series passes the merge,
+// so the PPM buffer is merged and then the tile decodes). All three are 128x128
+// 24-bit images written by this fork's own lossy FIF_J2K codec (16:1 rate), so an
+// pixel values are not asserted; the control pins that the codestream
+// decodes to the source dimensions with pixels present. A codec-wide regression
+// that rejected every J2K would fail it.
+static bool checkJ2KControlPixels(const char *id, FIBITMAP *bitmap, const char *entryPoint) {
+	if (!bitmap || !FreeImage_HasPixels(bitmap)
+		|| FreeImage_GetWidth(bitmap) != 128 || FreeImage_GetHeight(bitmap) != 128
+		|| (FreeImage_GetBPP(bitmap) != 24 && FreeImage_GetBPP(bitmap) != 32)) {
+		const unsigned w = bitmap ? FreeImage_GetWidth(bitmap) : 0;
+		const unsigned h = bitmap ? FreeImage_GetHeight(bitmap) : 0;
+		const unsigned bpp = bitmap ? FreeImage_GetBPP(bitmap) : 0;
+		printf("[FAIL] %s: %s control did not decode to a 128x128 24/32-bit bitmap (w=%u h=%u bpp=%u)\n",
+			id, entryPoint, w, h, bpp);
+		FreeImage_Unload(bitmap);
+		return false;
+	}
+	FreeImage_Unload(bitmap);
+	const char *what = strcmp(id, "CVE-2019-12214-base") == 0
+		? "128x128 no-PPM control" : "128x128 PPM-series control";
+	printf("%s: %s decoded the %s\n", id, entryPoint, what);
+	return true;
+}
+
+// CVE-2021-33367 boundary control. The control fixture is a full JPEG whose
+// APP1/Exif carries a 0th IFD with a *complete* 4-byte next-IFD field (a zero
+// thumbnail offset). The proof that the off-by-four guard at
+// source/Metadata/Exif.cpp:850 (was :786) is correct (not a blind "reject everything") rests
+// on this control decoding to the codec's real dimensions. Pinning the exact
+// 600x400 size means a regression that rejects every FIF_JPEG cannot satisfy it,
+// since the pixel body is untouched and only the Exif next-IFD boundary differs.
+static bool checkJPEGControlPixels(const char *id, FIBITMAP *bitmap, const char *entryPoint) {
+	if (!bitmap || !FreeImage_HasPixels(bitmap)
+		|| FreeImage_GetWidth(bitmap) != 600 || FreeImage_GetHeight(bitmap) != 400
+		|| FreeImage_GetBPP(bitmap) != 24) {
+		const unsigned w = bitmap ? FreeImage_GetWidth(bitmap) : 0;
+		const unsigned h = bitmap ? FreeImage_GetHeight(bitmap) : 0;
+		const unsigned bpp = bitmap ? FreeImage_GetBPP(bitmap) : 0;
+		printf("[FAIL] %s: %s control did not decode to a 600x400 24-bit bitmap (w=%u h=%u bpp=%u)\n",
+			id, entryPoint, w, h, bpp);
+		FreeImage_Unload(bitmap);
+		return false;
+	}
+	FreeImage_Unload(bitmap);
+	printf("%s: %s decoded the 600x400 complete-next-IFD control\n", id, entryPoint);
+	return true;
+}
+
+static bool checkCVEBitmap(const CVECase &test, FIBITMAP *bitmap, const char *entryPoint) {
+	if (test.expectation == DecodeRequired) {
+		if (strcmp(test.id, "CVE-2019-12214-base") == 0
+			|| strcmp(test.id, "CVE-2019-12214-V1-complete") == 0
+			|| strcmp(test.id, "CVE-2019-12214-V2-split") == 0)
+			return checkJ2KControlPixels(test.id, bitmap, entryPoint);
+		if (strcmp(test.id, "CVE-2021-33367-control") == 0)
+			return checkJPEGControlPixels(test.id, bitmap, entryPoint);
+		return checkPCXControlPixels(test.id, bitmap, entryPoint);
+	}
+	if (test.expectation == DecodeAny) {
+		if (!bitmap) {
+			printf("[FAIL] %s: %s rejected the image, a decode is expected\n", test.id, entryPoint);
+			return false;
+		}
+		const bool valid = FreeImage_HasPixels(bitmap) && FreeImage_GetWidth(bitmap) > 0 && FreeImage_GetHeight(bitmap) > 0;
+		printf("%s: %s %s %ux%u %u-bit\n", test.id, entryPoint, valid ? "decoded" : "decoded without pixels",
+			FreeImage_GetWidth(bitmap), FreeImage_GetHeight(bitmap), FreeImage_GetBPP(bitmap));
+		FreeImage_Unload(bitmap);
+		return valid;
+	}
+	if (!bitmap) {
+		printf("%s: %s rejected the image\n", test.id, entryPoint);
+		return true;
+	}
+	const bool valid = test.expectation == DecodeOrReject && FreeImage_HasPixels(bitmap)
+		&& FreeImage_GetWidth(bitmap) > 0 && FreeImage_GetHeight(bitmap) > 0;
+	FreeImage_Unload(bitmap);
+	printf("%s: %s %s\n", test.id, entryPoint, valid ? "decoded and unloaded" : "unexpected decode result");
+	return valid;
+}
+
+static bool checkJPEGAndTIFFValidImages(FREE_IMAGE_FORMAT format) {
+	const struct {
+		FREE_IMAGE_TYPE type;
+		int depth;
+	} images[] = {
+		{FIT_BITMAP, 1}, {FIT_BITMAP, 4}, {FIT_BITMAP, 8}, {FIT_BITMAP, 24}, {FIT_BITMAP, 32},
+		{FIT_UINT16, 16}, {FIT_RGB16, 48}, {FIT_FLOAT, 32}
+	};
+	const int jpegFlags[] = {JPEG_DEFAULT, JPEG_GREYSCALE, JPEG_CMYK, FIF_LOAD_NOPIXELS};
+	const int tiffFlags[] = {TIFF_DEFAULT, FIF_LOAD_NOPIXELS};
+	const int *flags = format == FIF_JPEG ? jpegFlags : tiffFlags;
+	const size_t flagCount = format == FIF_JPEG ? sizeof(jpegFlags) / sizeof(jpegFlags[0]) : sizeof(tiffFlags) / sizeof(tiffFlags[0]);
+	for (size_t index = 0; index < sizeof(images) / sizeof(images[0]); ++index) {
+		if (format == FIF_JPEG && (images[index].type != FIT_BITMAP || images[index].depth < 8)) continue;
+		FIBITMAP *source = FreeImage_AllocateT(images[index].type, 17, 9, images[index].depth);
+		if (!source) return false;
+		memset(FreeImage_GetBits(source), 0, FreeImage_GetPitch(source) * FreeImage_GetHeight(source));
+		if (format == FIF_JPEG && images[index].depth == 32) {
+			FreeImage_GetICCProfile(source)->flags |= FIICC_COLOR_IS_CMYK;
+		}
+		if (format == FIF_TIFF && images[index].type == FIT_BITMAP && images[index].depth > 1 && images[index].depth <= 8) {
+			RGBQUAD *palette = FreeImage_GetPalette(source);
+			for (unsigned color = 0; color < FreeImage_GetColorsUsed(source); ++color) {
+				palette[color].rgbRed = (BYTE)color;
+				palette[color].rgbGreen = 83;
+				palette[color].rgbBlue = 149;
+			}
+		}
+		FIMEMORY *encoded = FreeImage_OpenMemory();
+		bool passed = encoded && FreeImage_SaveToMemory(format, source, encoded);
+		for (size_t flagIndex = 0; passed && flagIndex < flagCount; ++flagIndex) {
+			if (format == FIF_JPEG && images[index].depth == 32 && flags[flagIndex] == JPEG_GREYSCALE) continue;
+			passed = FreeImage_SeekMemory(encoded, 0, SEEK_SET) != FALSE;
+			FIBITMAP *decoded = passed ? FreeImage_LoadFromMemory(format, encoded, flags[flagIndex]) : NULL;
+			unsigned expectedDepth = images[index].depth;
+			if (format == FIF_JPEG) {
+				if (flags[flagIndex] == JPEG_GREYSCALE) expectedDepth = 8;
+				else if (expectedDepth == 32 && flags[flagIndex] != JPEG_CMYK) expectedDepth = 24;
+			}
+			passed = decoded && FreeImage_GetWidth(decoded) == 17 && FreeImage_GetHeight(decoded) == 9
+				&& FreeImage_GetImageType(decoded) == images[index].type && FreeImage_GetBPP(decoded) == expectedDepth
+				&& (FreeImage_HasPixels(decoded) != FALSE) == (flags[flagIndex] != FIF_LOAD_NOPIXELS);
+			if (!passed) {
+				printf("Control layout: flags=%d type=%d depth=%u width=%u height=%u pixels=%d expectedDepth=%u\n",
+					flags[flagIndex], FreeImage_GetImageType(decoded), FreeImage_GetBPP(decoded),
+					FreeImage_GetWidth(decoded), FreeImage_GetHeight(decoded), FreeImage_HasPixels(decoded), expectedDepth);
+			}
+			if (passed && format == FIF_TIFF && flags[flagIndex] != FIF_LOAD_NOPIXELS
+				&& images[index].type == FIT_BITMAP && images[index].depth > 1 && images[index].depth <= 8) {
+				const RGBQUAD *original = FreeImage_GetPalette(source);
+				const RGBQUAD *restored = FreeImage_GetPalette(decoded);
+				passed = original && restored && original[0].rgbRed == restored[0].rgbRed
+					&& original[0].rgbGreen == restored[0].rgbGreen && original[0].rgbBlue == restored[0].rgbBlue;
+				if (!passed) printf("TIFF palette control differs at depth=%d\n", images[index].depth);
+			}
+			FreeImage_Unload(decoded);
+		}
+		if (encoded) FreeImage_CloseMemory(encoded);
+		FreeImage_Unload(source);
+		if (!passed) {
+			printf("[FAIL] %s valid-image control: type=%d depth=%d\n", FreeImage_GetFormatFromFIF(format), images[index].type, images[index].depth);
+			return false;
+		}
+	}
+	printf("%s valid-image and load-mode controls passed\n", FreeImage_GetFormatFromFIF(format));
+	return true;
+}
+
+// CVE-2024-28577 valid-WebP control. Proves the WebP loader still decodes a
+// well-formed image now that Load catches const char*: a 17x9 24-bit bitmap is
+// encoded by this fork's own FIF_WEBP writer and must round-trip through
+// FreeImage_LoadFromMemory in the default mode (pixels present) and in
+// FIF_LOAD_NOPIXELS header-only mode (no pixels, real dimensions). A
+// regression that rejects or crashes every WebP fails here, so the malformed
+// EXIF fixtures cannot pass by the codec rejecting everything.
+static bool checkWebPValidImages() {
+	FIBITMAP *source = FreeImage_Allocate(17, 9, 24);
+	if (!source) return false;
+	for (unsigned y = 0; y < FreeImage_GetHeight(source); ++y) {
+		BYTE *bits = FreeImage_GetScanLine(source, y);
+		for (unsigned x = 0; x < FreeImage_GetWidth(source); ++x) {
+			bits[FI_RGBA_BLUE] = (BYTE)(x * 7);
+			bits[FI_RGBA_GREEN] = (BYTE)(y * 3);
+			bits[FI_RGBA_RED] = (BYTE)(x + y);
+			bits += 3;
+		}
+	}
+	FIMEMORY *encoded = FreeImage_OpenMemory();
+	bool passed = encoded && FreeImage_SaveToMemory(FIF_WEBP, source, encoded);
+	const int flags[] = {WEBP_DEFAULT, FIF_LOAD_NOPIXELS};
+	for (size_t flagIndex = 0; passed && flagIndex < sizeof(flags) / sizeof(flags[0]); ++flagIndex) {
+		passed = FreeImage_SeekMemory(encoded, 0, SEEK_SET) != FALSE;
+		FIBITMAP *decoded = passed ? FreeImage_LoadFromMemory(FIF_WEBP, encoded, flags[flagIndex]) : NULL;
+		passed = decoded && FreeImage_GetWidth(decoded) == 17 && FreeImage_GetHeight(decoded) == 9
+			&& FreeImage_GetBPP(decoded) == 24
+			&& (FreeImage_HasPixels(decoded) != FALSE) == (flags[flagIndex] != FIF_LOAD_NOPIXELS);
+		FreeImage_Unload(decoded);
+	}
+	if (encoded) FreeImage_CloseMemory(encoded);
+	FreeImage_Unload(source);
+	if (!passed) {
+		printf("[FAIL] WebP valid-image control: default or header-only round trip\n");
+		return false;
+	}
+	printf("WebP valid-image control passed in default and header-only modes\n");
+	return true;
+}
+
+// CVE-2019-12214 PPM guard-message capture. The J2K plugin forwards OpenJPEG's
+// EVT_ERROR text to FreeImage_OutputMessageProc via j2k_error_callback
+// (Source/FreeImage/PluginJ2K.cpp:40, registered before opj_read_header at
+// :161). Each load is wrapped in its own capture window: the transcript is reset
+// immediately before the load and read immediately after it, so the file and
+// memory entry points are checked independently, and a guard message seen on the
+// file load cannot satisfy the memory load's assertion (and vice versa). The
+// sink NUL-terminates after every append and each reset also clears the first
+// byte, so an empty or shorter transcript can never expose stale bytes to strstr.
+// Recording the text lets a PPM case assert the *specific* opj_j2k_merge_ppm
+// guard fired by its exact hard-coded string (j2k.c:4023/4049), so a regression
+// that rejects earlier for another reason cannot satisfy the assertion: the exact
+// guard string would be absent from that entry point's transcript. The capture
+// lives in the worker child only (runCVEWorker runs one case per process), so
+// there is no cross-case contamination.
+//
+// The same per-entry-point capture backs the CVE-2024-28577 WebP EXIF diagnostic
+// assertions (webpExifGuard): the WebP Load catch(const char*)
+// (PluginWebP.cpp:417) forwards the shared EXIF parser's reject text through
+// FreeImage_OutputMessageProc, so the exact guard string lands in the transcript
+// of the load that triggered it, under the same reset-before-each-load
+// discipline.
+static char g_cveJ2KMessages[8192];
+static int g_cveJ2KMessageLen;
+
+// Reset before each load: zero the length and the first byte so an empty
+// transcript is a valid empty C string (a shorter transcript can never expose
+// stale bytes from the previous load to strstr).
+static void resetJ2KMessageCapture(void) {
+	g_cveJ2KMessageLen = 0;
+	g_cveJ2KMessages[0] = 0;
+}
+
+static void cveJ2KMessageSink(FREE_IMAGE_FORMAT, const char *msg) {
+	if (!msg) return;
+	for (const char *p = msg; *p; ++p) {
+		if (g_cveJ2KMessageLen >= (int)(sizeof(g_cveJ2KMessages)) - 1) {
+			g_cveJ2KMessageLen = (int)(sizeof(g_cveJ2KMessages)) - 1;
+			break;
+		}
+		g_cveJ2KMessages[g_cveJ2KMessageLen++] = *p;
+	}
+	g_cveJ2KMessages[g_cveJ2KMessageLen] = 0;
+}
+
+// Per-entry-point opj_j2k_merge_ppm guard diagnostic. g_cveJ2KMessages must hold
+// only the transcript of the load this call immediately follows (reset just before
+// that load). A1/A2/A3 must show "Not enough bytes to read Nppm" (j2k.c:4023);
+// C1/C2/C3/B1 must show "Corrupted PPM markers" (j2k.c:4049); a mismatch on any
+// single entry point gates the result, so a guard cannot be witnessed on one path
+// to mask an early, unrelated rejection on the other. V1/V2 are complete/split-
+// series controls whose proof is the positive DecodeRequired decode
+// (checkJ2KControlPixels): absence means no listed guard diagnostic was captured,
+// not that the merge ran, so for V1/V2 absence is reported informationally
+// and does not gate. Non-PPM cases skip. Returns true when the entry point is
+// acceptable.
+static bool j2kPPMGuard(const CVECase &test, const char *entryPoint) {
+	const bool nppmTrunc =
+		strcmp(test.id, "CVE-2019-12214-A1-nppm-trunc") == 0
+		|| strcmp(test.id, "CVE-2019-12214-A2-nppm-trunc") == 0
+		|| strcmp(test.id, "CVE-2019-12214-A3-nppm-trunc") == 0;
+	const bool corrupted =
+		strcmp(test.id, "CVE-2019-12214-C1-unfinished") == 0
+		|| strcmp(test.id, "CVE-2019-12214-C2-unfinished") == 0
+		|| strcmp(test.id, "CVE-2019-12214-C3-unfinished2") == 0
+		|| strcmp(test.id, "CVE-2019-12214-B1-oversized") == 0;
+	const bool ppControl =
+		strcmp(test.id, "CVE-2019-12214-V1-complete") == 0
+		|| strcmp(test.id, "CVE-2019-12214-V2-split") == 0;
+	if (nppmTrunc || corrupted) {
+		const char *required = nppmTrunc ? "Not enough bytes to read Nppm"
+			: "Corrupted PPM markers";
+		const bool observed = strstr(g_cveJ2KMessages, required) != NULL;
+		if (observed) {
+			printf("%s: %s observed opj_j2k_merge_ppm guard \"%s\"\n", test.id, entryPoint, required);
+		} else {
+			printf("[FAIL] %s: %s did not observe opj_j2k_merge_ppm guard \"%s\"\n", test.id, entryPoint, required);
+		}
+		return observed;
+	}
+	if (ppControl) {
+		// Complete/split-series controls: the proof is the positive DecodeRequired
+		// decode (checkJ2KControlPixels), not the guard. Inspect the transcript and
+		// report factually whether a PPM guard message was emitted; this does not
+		// gate the case, since a complete series legitimately emits no guard and
+		// absence does not, by itself, prove the merge ran.
+		const bool guardPresent =
+			strstr(g_cveJ2KMessages, "Not enough bytes to read Nppm") != NULL
+			|| strstr(g_cveJ2KMessages, "Corrupted PPM markers") != NULL;
+		printf("%s: %s transcript %s (complete/split series; the positive decode, not the guard, is the proof)\n",
+			test.id, entryPoint, guardPresent ? "observed an opj_j2k_merge_ppm guard message"
+				: "shows no opj_j2k_merge_ppm guard message");
+		return true;
+	}
+	return true;
+}
+
+// CVE-2024-28577 WebP EXIF guard diagnostic, asserted per entry point.
+// g_cveJ2KMessages must hold only the transcript of the load this call
+// immediately follows (reset just before that load), so the file and memory
+// entry points are checked independently and a diagnostic witnessed on one path
+// cannot satisfy the other's assertion. Each WebP EXIF reject case must show
+// the exact shared-EXIF-parser guard text its fixture is built to reach:
+// webp-exif-decode must throw "Invalid entriesCount0th" (Exif.cpp:842) and
+// webp-exif-nextifd must throw "Invalid next IFD offset" (Exif.cpp:853). The
+// WebP Load catch (PluginWebP.cpp:417) forwards the caught const char* through
+// FreeImage_OutputMessageProc, so the string appears in the transcript only
+// when the throw was caught inside Load; an uncaught throw terminates the
+// worker instead (a harness-visible crash). A mismatch on either entry point
+// gates the result, so an early, unrelated rejection (a different message, or
+// none) fails the case. Non-WebP-EXIF cases skip.
+static bool webpExifGuard(const CVECase &test, const char *entryPoint) {
+	const char *required = NULL;
+	if (strcmp(test.id, "CVE-2024-28577-webp-exif-decode") == 0) {
+		required = "Invalid entriesCount0th";
+	} else if (strcmp(test.id, "CVE-2024-28577-webp-exif-nextifd") == 0) {
+		required = "Invalid next IFD offset";
+	} else {
+		return true;
+	}
+	const bool observed = strstr(g_cveJ2KMessages, required) != NULL;
+	if (observed) {
+		printf("%s: %s observed EXIF parser guard \"%s\"\n", test.id, entryPoint, required);
+	} else {
+		printf("[FAIL] %s: %s did not observe EXIF parser guard \"%s\"\n", test.id, entryPoint, required);
+	}
+	return observed;
+}
+
+// ==========================================================================
+// Synthetic (in-worker generated) cases
+// ==========================================================================
+
+typedef std::vector<BYTE> Bytes;
+
+static void appendBytes(Bytes &out, const void *data, size_t size) {
+	const BYTE *bytes = (const BYTE *)data;
+	out.insert(out.end(), bytes, bytes + size);
+}
+static void appendLE16(Bytes &out, unsigned value) {
+	out.push_back((BYTE)value); out.push_back((BYTE)(value >> 8));
+}
+static void appendLE32(Bytes &out, DWORD value) {
+	appendLE16(out, value & 0xFFFF); appendLE16(out, value >> 16);
+}
+static void appendBE16(Bytes &out, unsigned value) {
+	out.push_back((BYTE)(value >> 8)); out.push_back((BYTE)value);
+}
+static void appendBE32(Bytes &out, DWORD value) {
+	appendBE16(out, value >> 16); appendBE16(out, value & 0xFFFF);
+}
+
+static bool writeTemporaryFile(const Bytes &data, std::string &path) {
+#ifdef WIN32
+	// Avoid GetTempFileName(uUnique = 0): it scans the temp directory and gets
+	// very slow when stale files accumulate. Use pid + counter and create exclusively.
+	char directory[MAX_PATH];
+	char file[MAX_PATH];
+	static volatile LONG counter = 0;
+	const DWORD length = GetTempPathA(sizeof(directory), directory);
+	if (!length || length >= sizeof(directory)) return false;
+	bool created = false;
+	for (int attempt = 0; attempt < 100 && !created; ++attempt) {
+		snprintf(file, sizeof(file), "%ssyn%lu_%lu_%ld.tmp", directory, GetCurrentProcessId(),
+			GetTickCount(), InterlockedIncrement(&counter));
+		const HANDLE handle = CreateFileA(file, GENERIC_WRITE, 0, NULL, CREATE_NEW, FILE_ATTRIBUTE_NORMAL, NULL);
+		if (handle != INVALID_HANDLE_VALUE) {
+			CloseHandle(handle);
+			created = true;
+		} else if (GetLastError() != ERROR_FILE_EXISTS) {
+			return false;
+		}
+	}
+	if (!created) return false;
+	path = file;
+#else
+	char file[] = "/tmp/freeimage-synthetic-XXXXXX";
+	const int descriptor = mkstemp(file);
+	if (descriptor < 0) return false;
+	close(descriptor);
+	path = file;
+#endif
+	FILE *output = fopen(path.c_str(), "wb");
+	if (!output) return false;
+	const bool written = data.empty() || fwrite(&data[0], 1, data.size(), output) == data.size();
+	const bool closed = fclose(output) == 0;
+	if (!written || !closed) {
+		remove(path.c_str());
+		return false;
+	}
+	return true;
+}
+
+// Bitmap assertion for a synthetic load. Must not unload the bitmap; the
+// caller unloads it after the check on every path.
+typedef bool (*SyntheticBitmapCheck)(const CVECase &test, FIBITMAP *bitmap, const char *entryPoint);
+
+// Run the generated bytes through the same pipeline as a fixture case:
+// autodetection + explicit-decoder FreeImage_Load from a temporary file, then
+// autodetection + explicit-decoder FreeImage_LoadFromMemory. The message
+// transcript is reset immediately before each load, so a check that inspects
+// g_cveJ2KMessages sees only the load it follows.
+static bool runSyntheticLoads(const CVECase &test, const Bytes &data, int flags, SyntheticBitmapCheck check) {
+	if (data.empty()) {
+		printf("[FAIL] %s: generator produced no data\n", test.id);
+		return false;
+	}
+	bool passed = true;
+	std::string path;
+	if (!writeTemporaryFile(data, path)) {
+		printf("[FAIL] %s: cannot write temporary input\n", test.id);
+		return false;
+	}
+	const FREE_IMAGE_FORMAT detected = FreeImage_GetFileType(path.c_str());
+	if (detected != test.format) {
+		printf("[FAIL] %s: file autodetection returned %d, expected %d\n", test.id, detected, test.format);
+		passed = false;
+	}
+	resetJ2KMessageCapture();
+	FIBITMAP *fileBitmap = FreeImage_Load(test.format, path.c_str(), flags);
+	passed = check(test, fileBitmap, "file") && passed;
+	FreeImage_Unload(fileBitmap);
+	remove(path.c_str());
+
+	FIMEMORY *memory = FreeImage_OpenMemory(const_cast<BYTE *>(&data[0]), (DWORD)data.size());
+	if (!memory) {
+		printf("[FAIL] %s: cannot open memory stream\n", test.id);
+		return false;
+	}
+	const FREE_IMAGE_FORMAT memoryFormat = FreeImage_GetFileTypeFromMemory(memory);
+	if (memoryFormat != test.format || !FreeImage_SeekMemory(memory, 0, SEEK_SET)) {
+		printf("[FAIL] %s: memory autodetection returned %d, expected %d\n", test.id, memoryFormat, test.format);
+		passed = false;
+	}
+	resetJ2KMessageCapture();
+	FIBITMAP *memoryBitmap = FreeImage_LoadFromMemory(test.format, memory, flags);
+	passed = check(test, memoryBitmap, "memory") && passed;
+	FreeImage_Unload(memoryBitmap);
+	FreeImage_CloseMemory(memory);
+	return passed;
+}
+
+static Bytes encodeWithFreeImage(FIBITMAP *source, FREE_IMAGE_FORMAT format, int flags) {
+	Bytes encoded;
+	FIMEMORY *memory = FreeImage_OpenMemory();
+	if (memory && source && FreeImage_SaveToMemory(format, source, memory, flags)) {
+		BYTE *bytes = NULL;
+		DWORD length = 0;
+		if (FreeImage_AcquireMemory(memory, &bytes, &length) && bytes && length) {
+			encoded.assign(bytes, bytes + length);
+		}
+	}
+	if (memory) FreeImage_CloseMemory(memory);
+	return encoded;
+}
+
+static Bytes encodeTestJPEG(unsigned width, unsigned height) {
+	FIBITMAP *source = FreeImage_Allocate(width, height, 24);
+	if (!source) return Bytes();
+	for (unsigned y = 0; y < height; ++y) {
+		BYTE *bits = FreeImage_GetScanLine(source, y);
+		for (unsigned x = 0; x < width; ++x, bits += 3) {
+			bits[FI_RGBA_RED] = (BYTE)(x * 13);
+			bits[FI_RGBA_GREEN] = (BYTE)(y * 29);
+			bits[FI_RGBA_BLUE] = 0x80;
+		}
+	}
+	Bytes encoded = encodeWithFreeImage(source, FIF_JPEG, JPEG_DEFAULT);
+	FreeImage_Unload(source);
+	return encoded;
+}
+
+// --------------------------------------------------------------------------
+// TIFF Photoshop-resource thumbnail (CVE-2020-24293 retained path)
+// --------------------------------------------------------------------------
+
+static void appendTIFFEntry(Bytes &out, WORD tag, WORD type, DWORD count, DWORD value) {
+	appendLE16(out, tag);
+	appendLE16(out, type);
+	appendLE32(out, count);
+	if (type == 3 && count == 1) {
+		appendLE16(out, value);
+		appendLE16(out, 0);
+	} else {
+		appendLE32(out, value);
+	}
+}
+
+// Minimal valid little-endian TIFF: 2x2, 8-bit min-is-black, uncompressed,
+// one strip, plus TIFFTAG_PHOTOSHOP (34377, BYTE[n]) carrying `photoshop`.
+static Bytes buildPhotoshopTIFF(const Bytes &photoshop) {
+	const WORD entries = 10;
+	const DWORD ifdOffset = 8;
+	const DWORD pixelOffset = ifdOffset + 2 + entries * 12 + 4;
+	const DWORD photoshopOffset = pixelOffset + 4;
+	Bytes tiff;
+	appendBytes(tiff, "II", 2);
+	appendLE16(tiff, 42);
+	appendLE32(tiff, ifdOffset);
+	appendLE16(tiff, entries);
+	appendTIFFEntry(tiff, 256, 3, 1, 2);             // ImageWidth
+	appendTIFFEntry(tiff, 257, 3, 1, 2);             // ImageLength
+	appendTIFFEntry(tiff, 258, 3, 1, 8);             // BitsPerSample
+	appendTIFFEntry(tiff, 259, 3, 1, 1);             // Compression = none
+	appendTIFFEntry(tiff, 262, 3, 1, 1);             // Photometric = min-is-black
+	appendTIFFEntry(tiff, 273, 4, 1, pixelOffset);   // StripOffsets
+	appendTIFFEntry(tiff, 277, 3, 1, 1);             // SamplesPerPixel
+	appendTIFFEntry(tiff, 278, 3, 1, 2);             // RowsPerStrip
+	appendTIFFEntry(tiff, 279, 4, 1, 4);             // StripByteCounts
+	appendTIFFEntry(tiff, 34377, 1, (DWORD)photoshop.size(), photoshopOffset); // Photoshop
+	appendLE32(tiff, 0);
+	const BYTE pixels[4] = {0x10, 0x20, 0x30, 0x40};
+	appendBytes(tiff, pixels, sizeof(pixels));
+	appendBytes(tiff, &photoshop[0], photoshop.size());
+	return tiff;
+}
+
+// One Photoshop image-resource block: '8BIM', ID, empty padded Pascal name,
+// declared size, data, even padding.
+static void appendPhotoshopResource(Bytes &out, WORD id, const Bytes &data, DWORD declaredSize) {
+	appendBytes(out, "8BIM", 4);
+	appendBE16(out, id);
+	out.push_back(0);
+	out.push_back(0);
+	appendBE32(out, declaredSize);
+	if (!data.empty()) appendBytes(out, &data[0], data.size());
+	if (data.size() & 1) out.push_back(0);
+}
+
+// 28-byte thumbnail resource header (Adobe "Thumbnail resource header").
+static Bytes thumbnailHeader(DWORD format, DWORD width, DWORD height, DWORD widthBytes,
+	DWORD totalSize, DWORD compressedSize, WORD bpp, WORD planes) {
+	Bytes header;
+	appendBE32(header, format);
+	appendBE32(header, width);
+	appendBE32(header, height);
+	appendBE32(header, widthBytes);
+	appendBE32(header, totalSize);
+	appendBE32(header, compressedSize);
+	appendBE16(header, bpp);
+	appendBE16(header, planes);
+	return header;
+}
+
+// Raw 3x2 24-bit control pixels, top row first, RGB order, 12-byte padded rows.
+static const BYTE kRawThumbRGB[2][3][3] = {
+	{{10, 20, 30}, {40, 50, 60}, {70, 80, 90}},
+	{{100, 110, 120}, {130, 140, 150}, {160, 170, 180}}
+};
+
+static Bytes rawThumbnailResourceData(DWORD format) {
+	Bytes data = thumbnailHeader(format, 3, 2, 12, 24, 24, 24, 1);
+	for (int row = 0; row < 2; ++row) {
+		for (int x = 0; x < 3; ++x) appendBytes(data, kRawThumbRGB[row][x], 3);
+		for (int pad = 0; pad < 3; ++pad) data.push_back(0);
+	}
+	return data;
+}
+
+static Bytes buildPhotoshopThumbnailVariant(int variant) {
+	Bytes photoshop;
+	Bytes data;
+	switch (variant) {
+		case PSDT_RAW_OK:
+			data = rawThumbnailResourceData(0);
+			appendPhotoshopResource(photoshop, 1036, data, (DWORD)data.size());
+			break;
+		case PSDT_JPEG_OK: {
+			const Bytes jpeg = encodeTestJPEG(8, 8);
+			if (jpeg.empty()) return Bytes();
+			data = thumbnailHeader(1, 8, 8, 24, 192, (DWORD)jpeg.size(), 24, 1);
+			appendBytes(data, &jpeg[0], jpeg.size());
+			appendPhotoshopResource(photoshop, 1036, data, (DWORD)data.size());
+			break;
+		}
+		case PSDT_ROWBYTES:
+			// CVE-2020-24293 shape: each 4096-pixel row needs 12288 bytes but
+			// the declared row buffer is 4 bytes.
+			data = thumbnailHeader(0, 4096, 2, 4, 8, 8, 24, 1);
+			data.insert(data.end(), 8, 0x41);
+			appendPhotoshopResource(photoshop, 1036, data, (DWORD)data.size());
+			break;
+		case PSDT_BPP:
+			// 200 bpp: FreeImage_Allocate falls back to 8 bpp, while a naive
+			// copy writes width*bpp/8 bytes per row.
+			data = thumbnailHeader(0, 64, 2, 1600, 3200, 3200, 200, 1);
+			data.insert(data.end(), 3200, 0x41);
+			appendPhotoshopResource(photoshop, 1036, data, (DWORD)data.size());
+			break;
+		case PSDT_HEIGHT_NEG:
+			// height = -2: allocation uses abs(), a naive row loop runs ~2^32 times.
+			data = thumbnailHeader(0, 2, 0xFFFFFFFEu, 8, 16, 16, 24, 1);
+			data.insert(data.end(), 16, 0x41);
+			appendPhotoshopResource(photoshop, 1036, data, (DWORD)data.size());
+			break;
+		case PSDT_WIDTH_ZERO:
+			data = thumbnailHeader(0, 0, 2, 4, 8, 8, 24, 1);
+			data.insert(data.end(), 8, 0x41);
+			appendPhotoshopResource(photoshop, 1036, data, (DWORD)data.size());
+			break;
+		case PSDT_TRUNCATED:
+			// Valid 3x2 header, but only 6 of the 24 pixel bytes are present.
+			data = thumbnailHeader(0, 3, 2, 12, 24, 24, 24, 1);
+			data.insert(data.end(), 6, 0x41);
+			appendPhotoshopResource(photoshop, 1036, data, (DWORD)data.size());
+			break;
+		case PSDT_SHORT_RESOURCE:
+			// 20-byte resource: shorter than the 28-byte thumbnail header.
+			data = rawThumbnailResourceData(0);
+			data.resize(20);
+			appendPhotoshopResource(photoshop, 1036, data, (DWORD)data.size());
+			break;
+		case PSDT_OVERSIZE_RESOURCE:
+			// A valid raw thumbnail whose declared resource size exceeds the block.
+			data = rawThumbnailResourceData(0);
+			appendPhotoshopResource(photoshop, 1036, data, 0x7FFFFFF0u);
+			break;
+		case PSDT_FORMAT_UNKNOWN:
+			// Only 0 (kRawRGB) and 1 (kJpegRGB) are defined.
+			data = rawThumbnailResourceData(7);
+			appendPhotoshopResource(photoshop, 1036, data, (DWORD)data.size());
+			break;
+		case PSDT_JPEG_GARBAGE:
+			data = thumbnailHeader(1, 8, 8, 24, 192, 16, 24, 1);
+			appendBytes(data, "not a JPEG file!", 16);
+			appendPhotoshopResource(photoshop, 1036, data, (DWORD)data.size());
+			break;
+		case PSDT_DISPLAYINFO_THROW: {
+			// DisplayInfo (1007) with opacity 101 makes psdDisplayInfo::Read
+			// throw before the (valid) thumbnail resource is reached.
+			Bytes display;
+			for (int field = 0; field < 5; ++field) appendBE16(display, 0);
+			appendBE16(display, 101);
+			display.push_back(0);
+			display.push_back(0);
+			appendPhotoshopResource(photoshop, 1007, display, (DWORD)display.size());
+			data = rawThumbnailResourceData(0);
+			appendPhotoshopResource(photoshop, 1036, data, (DWORD)data.size());
+			break;
+		}
+		case PSDT_ODD_RAW_OK: {
+			// 1-byte unknown resource (declared 1, padded to 2), then a 3x1
+			// raw thumbnail with unpadded 9-byte rows: payload 28 + 9 = 37.
+			Bytes odd(1, 0x5A);
+			appendPhotoshopResource(photoshop, 4000, odd, 1);
+			data = thumbnailHeader(0, 3, 1, 9, 9, 9, 24, 1);
+			for (int x = 0; x < 3; ++x) appendBytes(data, kRawThumbRGB[0][x], 3);
+			appendPhotoshopResource(photoshop, 1036, data, (DWORD)data.size());
+			break;
+		}
+		case PSDT_ODD_PAD_COMPLETES_ROW:
+			// 3x2 raw thumbnail needs 24 data bytes; only 23 are declared
+			// (payload 51, odd). The zero pad byte makes the stream hold 24.
+			data = rawThumbnailResourceData(0);
+			data.resize(28 + 23);
+			appendPhotoshopResource(photoshop, 1036, data, (DWORD)data.size());
+			break;
+		default:
+			return Bytes();
+	}
+	return buildPhotoshopTIFF(photoshop);
+}
+
+static bool checkTIFFPhotoshopThumbnail(const CVECase &test, FIBITMAP *bitmap, const char *entryPoint) {
+	if (!bitmap || !FreeImage_HasPixels(bitmap) || FreeImage_GetWidth(bitmap) != 2
+		|| FreeImage_GetHeight(bitmap) != 2 || FreeImage_GetBPP(bitmap) != 8) {
+		printf("[FAIL] %s: %s did not decode the 2x2 8-bit main image\n", test.id, entryPoint);
+		return false;
+	}
+	FIBITMAP *thumbnail = FreeImage_GetThumbnail(bitmap);
+	if (test.variant == PSDT_RAW_OK) {
+		if (!thumbnail || FreeImage_GetWidth(thumbnail) != 3 || FreeImage_GetHeight(thumbnail) != 2
+			|| FreeImage_GetBPP(thumbnail) != 24) {
+			printf("[FAIL] %s: %s did not attach the 3x2 24-bit raw thumbnail\n", test.id, entryPoint);
+			return false;
+		}
+		// The first stored row is the top row (FreeImage y = height - 1).
+		for (int row = 0; row < 2; ++row) {
+			for (int x = 0; x < 3; ++x) {
+				RGBQUAD color;
+				if (!FreeImage_GetPixelColor(thumbnail, x, 1 - row, &color)
+					|| color.rgbRed != kRawThumbRGB[row][x][0] || color.rgbGreen != kRawThumbRGB[row][x][1]
+					|| color.rgbBlue != kRawThumbRGB[row][x][2]) {
+					printf("[FAIL] %s: %s raw thumbnail pixel %d,%d differs\n", test.id, entryPoint, x, 1 - row);
+					return false;
+				}
+			}
+		}
+		printf("%s: %s decoded main image and exact 3x2 raw thumbnail\n", test.id, entryPoint);
+		return true;
+	}
+	if (test.variant == PSDT_ODD_RAW_OK) {
+		if (!thumbnail || FreeImage_GetWidth(thumbnail) != 3 || FreeImage_GetHeight(thumbnail) != 1
+			|| FreeImage_GetBPP(thumbnail) != 24) {
+			printf("[FAIL] %s: %s did not attach the 3x1 odd-length raw thumbnail\n", test.id, entryPoint);
+			return false;
+		}
+		for (int x = 0; x < 3; ++x) {
+			RGBQUAD color;
+			if (!FreeImage_GetPixelColor(thumbnail, x, 0, &color)
+				|| color.rgbRed != kRawThumbRGB[0][x][0] || color.rgbGreen != kRawThumbRGB[0][x][1]
+				|| color.rgbBlue != kRawThumbRGB[0][x][2]) {
+				printf("[FAIL] %s: %s odd-length raw thumbnail pixel %d differs\n", test.id, entryPoint, x);
+				return false;
+			}
+		}
+		printf("%s: %s decoded main image and exact 3x1 odd-length raw thumbnail\n", test.id, entryPoint);
+		return true;
+	}
+	if (test.variant == PSDT_JPEG_OK) {
+		if (!thumbnail || FreeImage_GetWidth(thumbnail) != 8 || FreeImage_GetHeight(thumbnail) != 8
+			|| FreeImage_GetBPP(thumbnail) != 24 || !FreeImage_HasPixels(thumbnail)) {
+			printf("[FAIL] %s: %s did not attach the 8x8 JPEG thumbnail\n", test.id, entryPoint);
+			return false;
+		}
+		printf("%s: %s decoded main image and 8x8 JPEG thumbnail\n", test.id, entryPoint);
+		return true;
+	}
+	if (thumbnail) {
+		printf("[FAIL] %s: %s attached a %ux%u thumbnail from a malformed resource\n", test.id, entryPoint,
+			FreeImage_GetWidth(thumbnail), FreeImage_GetHeight(thumbnail));
+		return false;
+	}
+	printf("%s: %s decoded main image and attached no thumbnail\n", test.id, entryPoint);
+	return true;
+}
+
+static bool runTIFFPhotoshopThumbnailCase(const CVECase &test) {
+	return runSyntheticLoads(test, buildPhotoshopThumbnailVariant(test.variant), test.flags, checkTIFFPhotoshopThumbnail);
+}
+
+// --------------------------------------------------------------------------
+// Shared EXIF directory parser
+// --------------------------------------------------------------------------
+
+struct ExifEntry {
+	WORD tag;
+	WORD type;
+	DWORD count;
+	DWORD value;	// inline value (little-endian, left-justified) or offset
+};
+
+// Write a little-endian IFD at `offset`, growing `tiff` as needed.
+static void putExifIFD(Bytes &tiff, size_t offset, const ExifEntry *entries, WORD count, DWORD next) {
+	Bytes ifd;
+	appendLE16(ifd, count);
+	for (WORD index = 0; index < count; ++index) {
+		appendLE16(ifd, entries[index].tag);
+		appendLE16(ifd, entries[index].type);
+		appendLE32(ifd, entries[index].count);
+		appendLE32(ifd, entries[index].value);
+	}
+	appendLE32(ifd, next);
+	if (tiff.size() < offset + ifd.size()) tiff.resize(offset + ifd.size(), 0);
+	memcpy(&tiff[offset], &ifd[0], ifd.size());
+}
+
+static void putBytesAt(Bytes &tiff, size_t offset, const void *data, size_t size) {
+	if (tiff.size() < offset + size) tiff.resize(offset + size, 0);
+	memcpy(&tiff[offset], data, size);
+}
+
+static Bytes exifTIFFHeader(DWORD ifd0Offset) {
+	Bytes tiff;
+	appendBytes(tiff, "II*\0", 4);
+	appendLE32(tiff, ifd0Offset);
+	return tiff;
+}
+
+// Insert an APP1 segment carrying `payload` after SOI (and after APP0 if the
+// encoder wrote one) of a freshly encoded 16x8 JPEG.
+static Bytes buildJPEGWithAPP1(const Bytes &payload) {
+	Bytes jpeg = encodeTestJPEG(16, 8);
+	if (jpeg.size() < 4 || jpeg[0] != 0xFF || jpeg[1] != 0xD8 || payload.size() > 65533) return Bytes();
+	size_t insertAt = 2;
+	if (jpeg[2] == 0xFF && jpeg[3] == 0xE0 && jpeg.size() >= 6) {
+		insertAt = 4 + (((size_t)jpeg[4] << 8) | jpeg[5]);
+		if (insertAt > jpeg.size()) return Bytes();
+	}
+	Bytes segment;
+	segment.push_back(0xFF);
+	segment.push_back(0xE1);
+	appendBE16(segment, (unsigned)payload.size() + 2);
+	if (!payload.empty()) appendBytes(segment, &payload[0], payload.size());
+	jpeg.insert(jpeg.begin() + insertAt, segment.begin(), segment.end());
+	return jpeg;
+}
+
+static Bytes buildExifJPEG(const Bytes &tiff) {
+	Bytes payload;
+	appendBytes(payload, "Exif\0\0", 6);
+	appendBytes(payload, &tiff[0], tiff.size());
+	return buildJPEGWithAPP1(payload);
+}
+
+static Bytes buildExifVariant(int variant) {
+	Bytes tiff;
+	switch (variant) {
+		case EXIF_CONTROL: {
+			// IFD0 @8 {Make, ExifOffset} -> IFD1 @56; Exif IFD @38 {ISO=200};
+			// IFD1 {JPEGInterchangeFormat, Length}; Make @86; thumbnail @94.
+			const Bytes thumbnail = encodeTestJPEG(8, 4);
+			if (thumbnail.empty()) return Bytes();
+			tiff = exifTIFFHeader(8);
+			const ExifEntry ifd0[] = {{0x010F, 2, 8, 86}, {0x8769, 4, 1, 38}};
+			putExifIFD(tiff, 8, ifd0, 2, 56);
+			const ExifEntry exif[] = {{0x8827, 3, 1, 200}};
+			putExifIFD(tiff, 38, exif, 1, 0);
+			const ExifEntry ifd1[] = {{0x0201, 4, 1, 94}, {0x0202, 4, 1, (DWORD)thumbnail.size()}};
+			putExifIFD(tiff, 56, ifd1, 2, 0);
+			putBytesAt(tiff, 86, "FreeImg\0", 8);
+			putBytesAt(tiff, 94, &thumbnail[0], thumbnail.size());
+			break;
+		}
+		case EXIF_IFD0_AT_END:
+			// 0th-IFD offset == profile length: the 2-byte count is outside.
+			tiff = exifTIFFHeader(8);
+			break;
+		case EXIF_IFD0_STRADDLE:
+			// 0th-IFD offset == profile length - 1: the count straddles the end.
+			tiff = exifTIFFHeader(7);
+			break;
+		case EXIF_SUBIFD_COUNT_AT_END: {
+			// Exif IFD offset == profile length - 1.
+			tiff = exifTIFFHeader(8);
+			const ExifEntry ifd0[] = {{0x010F, 2, 8, 38}, {0x8769, 4, 1, 46}};
+			putExifIFD(tiff, 8, ifd0, 2, 0);
+			putBytesAt(tiff, 38, "FreeImg\0", 8);
+			tiff.push_back(0x01);
+			break;
+		}
+		case EXIF_SUBIFD_ENTRY_STRADDLE: {
+			// Exif IFD @46 with one LONG entry; the profile ends 2 bytes into
+			// the entry's value field (offset + 12*n fits, offset + 2 + 12*n
+			// does not).
+			tiff = exifTIFFHeader(8);
+			const ExifEntry ifd0[] = {{0x010F, 2, 8, 38}, {0x8769, 4, 1, 46}};
+			putExifIFD(tiff, 8, ifd0, 2, 0);
+			putBytesAt(tiff, 38, "FreeImg\0", 8);
+			const ExifEntry exif[] = {{0xA002, 4, 1, 0x11223344}};
+			putExifIFD(tiff, 46, exif, 1, 0);
+			tiff.resize(46 + 12);
+			break;
+		}
+		case EXIF_MAKERNOTE_OUTSIDE: {
+			// Nikon type-3 maker note (sub-IFD at +18) stored in the last 8
+			// bytes of the profile, so the sub-IFD lies 10 bytes past the end.
+			tiff = exifTIFFHeader(8);
+			const ExifEntry ifd0[] = {{0x010F, 2, 6, 38}, {0x927C, 7, 8, 44}};
+			putExifIFD(tiff, 8, ifd0, 2, 0);
+			putBytesAt(tiff, 38, "Nikon\0", 6);
+			putBytesAt(tiff, 44, "Nikon\0\x02\0", 8);
+			break;
+		}
+		case EXIF_MAKERNOTE_SHORT_SIGNATURE: {
+			// 5-byte maker note "KYOCE" at the end of the profile: the 22-byte
+			// Kyocera signature comparison must not read past it.
+			tiff = exifTIFFHeader(8);
+			const ExifEntry ifd0[] = {{0x010F, 2, 8, 38}, {0x927C, 7, 5, 46}};
+			putExifIFD(tiff, 8, ifd0, 2, 0);
+			putBytesAt(tiff, 38, "FreeImg\0", 8);
+			putBytesAt(tiff, 46, "KYOCE", 5);
+			break;
+		}
+		case EXIF_CANON_SUBTAG_WIDTH: {
+			// Canon maker note IFD @44: tag 0x0001 typed BYTE[4] (4-byte value,
+			// not WORDs) and a well-formed tag 0x0004 SHORT[3] @74.
+			tiff = exifTIFFHeader(8);
+			const ExifEntry ifd0[] = {{0x010F, 2, 6, 38}, {0x927C, 7, 36, 44}};
+			putExifIFD(tiff, 8, ifd0, 2, 0);
+			putBytesAt(tiff, 38, "Canon\0", 6);
+			const ExifEntry canon[] = {{0x0001, 1, 4, 0x44434241}, {0x0004, 3, 3, 74}};
+			putExifIFD(tiff, 44, canon, 2, 0);
+			const BYTE shorts[6] = {7, 0, 8, 0, 9, 0};
+			putBytesAt(tiff, 74, shorts, sizeof(shorts));
+			break;
+		}
+		case EXIF_IFD1_COUNT_AT_END: {
+			// 1st-IFD (thumbnail) offset == profile length - 1.
+			tiff = exifTIFFHeader(8);
+			const ExifEntry ifd0[] = {{0x010F, 2, 8, 26}};
+			putExifIFD(tiff, 8, ifd0, 1, 34);
+			putBytesAt(tiff, 26, "FreeImg\0", 8);
+			tiff.push_back(0x01);
+			break;
+		}
+		case EXIF_APP1_SHORT_HEADER: {
+			// "Exif\0\0" + 4 of the 8 TIFF-header bytes.
+			Bytes payload;
+			appendBytes(payload, "Exif\0\0II*\0", 10);
+			return buildJPEGWithAPP1(payload);
+		}
+		case EXIF_APP1_TINY: {
+			Bytes payload;
+			appendBytes(payload, "Ex", 2);
+			return buildJPEGWithAPP1(payload);
+		}
+		default:
+			return Bytes();
+	}
+	return buildExifJPEG(tiff);
+}
+
+static FITAG *findTag(FREE_IMAGE_MDMODEL model, FIBITMAP *bitmap, const char *key) {
+	FITAG *tag = NULL;
+	return FreeImage_GetMetadata(model, bitmap, key, &tag) ? tag : NULL;
+}
+
+static bool hasMakerNoteTagID(FIBITMAP *bitmap, WORD id) {
+	FITAG *tag = NULL;
+	FIMETADATA *handle = FreeImage_FindFirstMetadata(FIMD_EXIF_MAKERNOTE, bitmap, &tag);
+	bool found = false;
+	if (handle) {
+		do {
+			if (FreeImage_GetTagID(tag) == id) found = true;
+		} while (!found && FreeImage_FindNextMetadata(handle, &tag));
+		FreeImage_FindCloseMetadata(handle);
+	}
+	return found;
+}
+
+static bool hasMake(FIBITMAP *bitmap, const char *expected) {
+	FITAG *make = findTag(FIMD_EXIF_MAIN, bitmap, "Make");
+	return make && FreeImage_GetTagValue(make) && FreeImage_GetTagLength(make) >= strlen(expected)
+		&& strncmp((const char *)FreeImage_GetTagValue(make), expected, strlen(expected)) == 0;
+}
+
+static bool checkExifDirectory(const CVECase &test, FIBITMAP *bitmap, const char *entryPoint) {
+	if (!bitmap || !FreeImage_HasPixels(bitmap) || FreeImage_GetWidth(bitmap) != 16
+		|| FreeImage_GetHeight(bitmap) != 8 || FreeImage_GetBPP(bitmap) != 24) {
+		printf("[FAIL] %s: %s did not decode the 16x8 24-bit main image\n", test.id, entryPoint);
+		return false;
+	}
+	const char *failure = NULL;
+	switch (test.variant) {
+		case EXIF_CONTROL: {
+			FITAG *iso = findTag(FIMD_EXIF_EXIF, bitmap, "ISOSpeedRatings");
+			FIBITMAP *thumbnail = FreeImage_GetThumbnail(bitmap);
+			if (!hasMake(bitmap, "FreeImg")) failure = "Make tag missing or wrong";
+			else if (!iso || FreeImage_GetTagType(iso) != FIDT_SHORT || FreeImage_GetTagCount(iso) != 1
+				|| *(const WORD *)FreeImage_GetTagValue(iso) != 200) failure = "Exif-IFD ISOSpeedRatings missing or wrong";
+			else if (!thumbnail || FreeImage_GetWidth(thumbnail) != 8 || FreeImage_GetHeight(thumbnail) != 4)
+				failure = "8x4 IFD1 thumbnail missing";
+			break;
+		}
+		case EXIF_IFD0_AT_END:
+		case EXIF_IFD0_STRADDLE:
+		case EXIF_APP1_SHORT_HEADER:
+		case EXIF_APP1_TINY:
+			if (FreeImage_GetMetadataCount(FIMD_EXIF_MAIN, bitmap) != 0) failure = "0th-IFD tags stored from out-of-profile data";
+			break;
+		case EXIF_SUBIFD_COUNT_AT_END:
+			if (!hasMake(bitmap, "FreeImg")) failure = "0th-IFD Make lost";
+			else if (FreeImage_GetMetadataCount(FIMD_EXIF_EXIF, bitmap) != 0) failure = "Exif-IFD tags stored from out-of-profile data";
+			break;
+		case EXIF_SUBIFD_ENTRY_STRADDLE:
+			if (!hasMake(bitmap, "FreeImg")) failure = "0th-IFD Make lost";
+			else if (findTag(FIMD_EXIF_EXIF, bitmap, "PixelXDimension")) failure = "straddling Exif-IFD entry was stored";
+			break;
+		case EXIF_MAKERNOTE_OUTSIDE:
+			if (!hasMake(bitmap, "Nikon")) failure = "0th-IFD Make lost";
+			else if (FreeImage_GetMetadataCount(FIMD_EXIF_MAKERNOTE, bitmap) != 0) failure = "maker-note tags read from outside the profile";
+			break;
+		case EXIF_MAKERNOTE_SHORT_SIGNATURE:
+			if (!hasMake(bitmap, "FreeImg")) failure = "0th-IFD Make lost";
+			else if (FreeImage_GetMetadataCount(FIMD_EXIF_MAKERNOTE, bitmap) != 0) failure = "short maker note matched a longer signature";
+			break;
+		case EXIF_CANON_SUBTAG_WIDTH:
+			if (!hasMake(bitmap, "Canon")) failure = "0th-IFD Make lost";
+			else if (hasMakerNoteTagID(bitmap, 0xC101) || hasMakerNoteTagID(bitmap, 0xC102) || hasMakerNoteTagID(bitmap, 0xC103))
+				failure = "Canon sub-tags expanded as WORDs from a BYTE[4] value";
+			else if (!hasMakerNoteTagID(bitmap, 0x0001)) failure = "BYTE-typed Canon tag 0x0001 not kept as a plain tag";
+			else if (!hasMakerNoteTagID(bitmap, 0xC401) || !hasMakerNoteTagID(bitmap, 0xC402))
+				failure = "well-formed Canon SHORT[3] sub-tags 0xC401/0xC402 missing";
+			break;
+		case EXIF_IFD1_COUNT_AT_END:
+			if (!hasMake(bitmap, "FreeImg")) failure = "0th-IFD Make lost";
+			else if (FreeImage_GetThumbnail(bitmap)) failure = "thumbnail attached from out-of-profile IFD1";
+			break;
+		default:
+			failure = "unknown variant";
+			break;
+	}
+	if (failure) {
+		printf("[FAIL] %s: %s %s\n", test.id, entryPoint, failure);
+		return false;
+	}
+	printf("%s: %s decoded 16x8 main image with the expected EXIF metadata\n", test.id, entryPoint);
+	return true;
+}
+
+static bool runExifDirectoryCase(const CVECase &test) {
+	return runSyntheticLoads(test, buildExifVariant(test.variant), test.flags, checkExifDirectory);
+}
+
+// --------------------------------------------------------------------------
+// HDR dimension parser
+// --------------------------------------------------------------------------
+
+// Exact RGBE pixel: exponent 136 gives a scale of 2^0, so each mantissa byte
+// decodes to exactly that float value.
+static void appendRGBE(Bytes &out, BYTE r, BYTE g, BYTE b) {
+	out.push_back(r); out.push_back(g); out.push_back(b); out.push_back(136);
+}
+
+static BYTE hdrRed(unsigned x, unsigned y) { return (BYTE)(10 * y + x); }
+static BYTE hdrGreen(unsigned x, unsigned y) { return (BYTE)(100 + x); }
+static BYTE hdrBlue(unsigned x, unsigned y) { return (BYTE)(200 + y); }
+
+// Header + size line + `pixels` flat (non-RLE) RGBE pixels in file order.
+static Bytes buildHDR(const char *sizeLine, unsigned pixels, unsigned width) {
+	Bytes hdr;
+	const char *header = "#?RADIANCE\n# FreeImage synthetic\nFORMAT=32-bit_rle_rgbe\n\n";
+	appendBytes(hdr, header, strlen(header));
+	appendBytes(hdr, sizeLine, strlen(sizeLine));
+	for (unsigned index = 0; index < pixels; ++index) {
+		const unsigned x = width ? index % width : 0;
+		const unsigned y = width ? index / width : 0;
+		appendRGBE(hdr, hdrRed(x, y), hdrGreen(x, y), hdrBlue(x, y));
+	}
+	return hdr;
+}
+
+// 17x9 RGBF image written by this fork's own HDR encoder (width >= 8 -> RLE
+// scanlines). Channel values are integers with max in [128, 256) and the
+// others < 256, so RGBE quantisation is exact.
+static float hdrRoundTripValue(unsigned x, unsigned y, int channel) {
+	switch (channel) {
+		case 0: return (float)(128 + (x + 3 * y) % 100);
+		case 1: return (float)(x * 5);
+		default: return (float)(y * 7);
+	}
+}
+
+static Bytes buildHDRRoundTrip() {
+	FIBITMAP *source = FreeImage_AllocateT(FIT_RGBF, 17, 9);
+	if (!source) return Bytes();
+	for (unsigned y = 0; y < 9; ++y) {
+		FIRGBF *line = (FIRGBF *)FreeImage_GetScanLine(source, y);
+		for (unsigned x = 0; x < 17; ++x) {
+			line[x].red = hdrRoundTripValue(x, y, 0);
+			line[x].green = hdrRoundTripValue(x, y, 1);
+			line[x].blue = hdrRoundTripValue(x, y, 2);
+		}
+	}
+	Bytes encoded = encodeWithFreeImage(source, FIF_HDR, 0);
+	FreeImage_Unload(source);
+	return encoded;
+}
+
+static Bytes buildHDRVariant(int variant) {
+	switch (variant) {
+		case HDR_FLAT_OK:          return buildHDR("-Y 3 +X 5\n", 15, 5);
+		case HDR_RLE_ROUNDTRIP_OK: return buildHDRRoundTrip();
+		case HDR_PLUS_X_OK:        return buildHDR("+X 3 +Y 5\n", 15, 5);
+		case HDR_WHITESPACE_OK:    return buildHDR("  -Y   3 \t+X  5  \n", 15, 5);
+		case HDR_ONE_BY_ONE_OK:    return buildHDR("-Y 1 +X 1\n", 1, 1);
+		case HDR_ZERO_HEIGHT:      return buildHDR("-Y 0 +X 5\n", 15, 5);
+		case HDR_ZERO_WIDTH:       return buildHDR("-Y 3 +X 0\n", 15, 5);
+		case HDR_NEGATIVE:         return buildHDR("-Y -3 +X 5\n", 15, 5);
+		case HDR_ABOVE_INT_MAX:    return buildHDR("-Y 2147483648 +X 1\n", 4, 1);
+		case HDR_ERANGE:           return buildHDR("-Y 99999999999999999999 +X 1\n", 4, 1);
+		case HDR_MISSING_VALUE:    return buildHDR("-Y 3 +X\n", 15, 5);
+		case HDR_MISSING_TAG:      return buildHDR("3 5\n", 15, 5);
+		case HDR_NON_NUMERIC:      return buildHDR("-Y abc +X 5\n", 15, 5);
+		case HDR_TRUNCATED_PIXELS: return buildHDR("-Y 3 +X 5\n", 10, 5);
+		default:                   return Bytes();
+	}
+}
+
+static bool checkHDRFlatPixels(const CVECase &test, FIBITMAP *bitmap, const char *entryPoint, unsigned width, unsigned height) {
+	for (unsigned y = 0; y < height; ++y) {
+		// File scanline y is stored at FreeImage row height - 1 - y.
+		const FIRGBF *line = (const FIRGBF *)FreeImage_GetScanLine(bitmap, height - 1 - y);
+		for (unsigned x = 0; x < width; ++x) {
+			if (line[x].red != hdrRed(x, y) || line[x].green != hdrGreen(x, y) || line[x].blue != hdrBlue(x, y)) {
+				printf("[FAIL] %s: %s pixel %u,%u = %g/%g/%g\n", test.id, entryPoint, x, y,
+					line[x].red, line[x].green, line[x].blue);
+				return false;
+			}
+		}
+	}
+	return true;
+}
+
+static bool checkHDRDimensions(const CVECase &test, FIBITMAP *bitmap, const char *entryPoint) {
+	if (test.expectation == RejectImage) {
+		if (bitmap) {
+			printf("[FAIL] %s: %s decoded a malformed HDR (%ux%u)\n", test.id, entryPoint,
+				FreeImage_GetWidth(bitmap), FreeImage_GetHeight(bitmap));
+			return false;
+		}
+		const char *required = test.variant == HDR_TRUNCATED_PIXELS ? "RGBE read error"
+			: "missing or invalid image size specifier";
+		if (!strstr(g_cveJ2KMessages, required)) {
+			printf("[FAIL] %s: %s rejected without the \"%s\" diagnostic\n", test.id, entryPoint, required);
+			return false;
+		}
+		printf("%s: %s rejected with \"%s\"\n", test.id, entryPoint, required);
+		return true;
+	}
+	unsigned width = 5, height = 3;
+	if (test.variant == HDR_RLE_ROUNDTRIP_OK) { width = 17; height = 9; }
+	if (test.variant == HDR_ONE_BY_ONE_OK) { width = 1; height = 1; }
+	if (!bitmap || !FreeImage_HasPixels(bitmap) || FreeImage_GetImageType(bitmap) != FIT_RGBF
+		|| FreeImage_GetWidth(bitmap) != width || FreeImage_GetHeight(bitmap) != height) {
+		printf("[FAIL] %s: %s did not decode a %ux%u RGBF image\n", test.id, entryPoint, width, height);
+		return false;
+	}
+	if (test.variant == HDR_RLE_ROUNDTRIP_OK) {
+		for (unsigned y = 0; y < height; ++y) {
+			const FIRGBF *line = (const FIRGBF *)FreeImage_GetScanLine(bitmap, y);
+			for (unsigned x = 0; x < width; ++x) {
+				if (line[x].red != hdrRoundTripValue(x, y, 0) || line[x].green != hdrRoundTripValue(x, y, 1)
+					|| line[x].blue != hdrRoundTripValue(x, y, 2)) {
+					printf("[FAIL] %s: %s round-trip pixel %u,%u differs\n", test.id, entryPoint, x, y);
+					return false;
+				}
+			}
+		}
+	} else if (!checkHDRFlatPixels(test, bitmap, entryPoint, width, height)) {
+		return false;
+	}
+	printf("%s: %s decoded %ux%u with exact pixels\n", test.id, entryPoint, width, height);
+	return true;
+}
+
+static bool checkHDRHeaderOnly(const CVECase &test, FIBITMAP *bitmap, const char *entryPoint) {
+	unsigned width = 5, height = 3;
+	if (test.variant == HDR_RLE_ROUNDTRIP_OK) { width = 17; height = 9; }
+	if (test.variant == HDR_ONE_BY_ONE_OK) { width = 1; height = 1; }
+	if (!bitmap || FreeImage_HasPixels(bitmap) || FreeImage_GetWidth(bitmap) != width
+		|| FreeImage_GetHeight(bitmap) != height) {
+		printf("[FAIL] %s: %s header-only load did not report %ux%u without pixels\n", test.id, entryPoint, width, height);
+		return false;
+	}
+	printf("%s: %s header-only load reported %ux%u\n", test.id, entryPoint, width, height);
+	return true;
+}
+
+static bool runHDRDimensionCase(const CVECase &test) {
+	const Bytes data = buildHDRVariant(test.variant);
+	bool passed = runSyntheticLoads(test, data, test.flags, checkHDRDimensions);
+	if (test.expectation == DecodeRequired) {
+		passed = runSyntheticLoads(test, data, FIF_LOAD_NOPIXELS, checkHDRHeaderOnly) && passed;
+	}
+	return passed;
+}
+
+static int runCVEWorker(const CVECase &test, const char *root) {
+	if (!checkCVEPrerequisites(test, root)) return 2;
+	resetJ2KMessageCapture();
+	FreeImage_SetOutputMessage(cveJ2KMessageSink);
+	if (test.synthetic) {
+		setFormatFixtureRoot(root);
+		const bool passed = test.synthetic(test);
+		FreeImage_SetOutputMessage(NULL);
+		return passed ? 0 : 1;
+	}
+	const std::string path = fixturePath(test, root);
+	const FREE_IMAGE_FORMAT detected = FreeImage_GetFileType(path.c_str());
+	if (test.requireExactFormat ? detected != test.format
+		: (detected != FIF_UNKNOWN && detected != test.format)) {
+		printf("%s: detected format does not match the case registry\n", test.id);
+		return 2;
+	}
+	resetJ2KMessageCapture();
+	FIBITMAP *fileBitmap = FreeImage_Load(test.format, path.c_str(), test.flags);
+	bool passed = checkCVEBitmap(test, fileBitmap, "file");
+	passed = j2kPPMGuard(test, "file") && passed;
+	passed = webpExifGuard(test, "file") && passed;
+	FILE *input = fopen(path.c_str(), "rb");
+	if (!input) return 2;
+	if (fseek(input, 0, SEEK_END) != 0) {
+		fclose(input);
+		return 2;
+	}
+	const long length = ftell(input);
+	if (length <= 0 || length > 16 * 1024 * 1024 || fseek(input, 0, SEEK_SET) != 0) {
+		printf("%s: fixture must contain 1 to 16777216 bytes\n", test.id);
+		fclose(input);
+		return 2;
+	}
+	BYTE *bytes = (BYTE *)malloc((size_t)length);
+	if (!bytes) {
+		fclose(input);
+		return 2;
+	}
+	const bool readOK = fread(bytes, 1, (size_t)length, input) == (size_t)length;
+	fclose(input);
+	if (!readOK) {
+		free(bytes);
+		return 2;
+	}
+	FIMEMORY *memory = FreeImage_OpenMemory(bytes, (DWORD)length);
+	if (!memory) {
+		free(bytes);
+		return 2;
+	}
+	const FREE_IMAGE_FORMAT memoryFormat = FreeImage_GetFileTypeFromMemory(memory);
+	if ((test.requireExactFormat ? memoryFormat != test.format
+		: (memoryFormat != FIF_UNKNOWN && memoryFormat != test.format))
+		|| !FreeImage_SeekMemory(memory, 0, SEEK_SET)) {
+		FreeImage_CloseMemory(memory);
+		free(bytes);
+		return 2;
+	}
+	resetJ2KMessageCapture();
+	FIBITMAP *memoryBitmap = FreeImage_LoadFromMemory(test.format, memory, test.flags);
+	passed = checkCVEBitmap(test, memoryBitmap, "memory") && passed;
+	passed = j2kPPMGuard(test, "memory") && passed;
+	passed = webpExifGuard(test, "memory") && passed;
+	if (test.format == FIF_XPM) {
+		// The fork disables XPM (recognition-only plugin, load_proc NULL). Also
+		// exercise FIF_LOAD_NOPIXELS on both load paths, so a regression that
+		// re-enables XPM decoding or header-only loading is caught here as well
+		// as under the default flags.
+		const int flags[] = {FIF_LOAD_NOPIXELS};
+		for (size_t index = 0; index < sizeof(flags) / sizeof(flags[0]); ++index) {
+			passed = checkCVEBitmap(test, FreeImage_Load(FIF_XPM, path.c_str(), flags[index]), "file load-mode variant") && passed;
+			if (FreeImage_SeekMemory(memory, 0, SEEK_SET)) {
+				passed = checkCVEBitmap(test, FreeImage_LoadFromMemory(FIF_XPM, memory, flags[index]), "memory load-mode variant") && passed;
+			} else {
+				passed = false;
+			}
+		}
+	}
+	if (strcmp(test.id, "CVE-2021-40265") == 0 || strcmp(test.id, "CVE-2021-40266") == 0) {
+		const int flags[] = {JPEG_GREYSCALE, JPEG_CMYK, JPEG_ACCURATE, FIF_LOAD_NOPIXELS};
+		const size_t firstMode = test.format == FIF_TIFF ? 3 : 0;
+		for (size_t index = firstMode; index < sizeof(flags) / sizeof(flags[0]); ++index) {
+			FIBITMAP *fileBitmap = FreeImage_Load(test.format, path.c_str(), flags[index]);
+			if (!FreeImage_SeekMemory(memory, 0, SEEK_SET)) {
+				FreeImage_Unload(fileBitmap);
+				passed = false;
+				break;
+			}
+			FIBITMAP *memoryBitmap = FreeImage_LoadFromMemory(test.format, memory, flags[index]);
+			if (test.format == FIF_TIFF && flags[index] == FIF_LOAD_NOPIXELS) {
+				passed = (!fileBitmap || (!FreeImage_HasPixels(fileBitmap) && FreeImage_GetWidth(fileBitmap) > 0 && FreeImage_GetHeight(fileBitmap) > 0)) && passed;
+				passed = (!memoryBitmap || (!FreeImage_HasPixels(memoryBitmap) && FreeImage_GetWidth(memoryBitmap) > 0 && FreeImage_GetHeight(memoryBitmap) > 0)) && passed;
+				FreeImage_Unload(fileBitmap);
+				FreeImage_Unload(memoryBitmap);
+			} else {
+				passed = checkCVEBitmap(test, fileBitmap, "file load-mode variant") && passed;
+				passed = checkCVEBitmap(test, memoryBitmap, "memory load-mode variant") && passed;
+			}
+		}
+		passed = checkJPEGAndTIFFValidImages(test.format) && passed;
+	}
+	if (test.format == FIF_WEBP && test.expectation == RejectImage) {
+		// The malformed EXIF fixtures must not pass by the WebP codec rejecting
+		// or crashing on every input: prove a well-formed WebP still decodes in
+		// default and header-only modes.
+		passed = checkWebPValidImages() && passed;
+	}
+	FreeImage_CloseMemory(memory);
+	free(bytes);
+	FreeImage_SetOutputMessage(NULL);
+	return passed ? 0 : 1;
+}
+
+#ifdef WIN32
+enum WorkerResult {
+	WorkerPassed,
+	WorkerFailed,
+	WorkerCrashed,
+	WorkerTimedOut,
+	WorkerSetupFailed,
+	WorkerResourceLimited
+};
+
+static std::string quoteArgument(const std::string &argument) {
+	std::string quoted = "\"";
+	size_t slashes = 0;
+	for (size_t index = 0; index < argument.size(); ++index) {
+		const char character = argument[index];
+		if (character == '\\') {
+			++slashes;
+		} else {
+			quoted.append(character == '"' ? slashes * 2 + 1 : slashes, '\\');
+			quoted += character;
+			slashes = 0;
+		}
+	}
+	quoted.append(slashes * 2, '\\');
+	return quoted + "\"";
+}
+
+// Per-worker committed-memory cap. 512 MiB by default (the harness self-test's
+// memory-limit probe relies on it); --memory-limit-mb raises it for
+// instrumented builds such as AddressSanitizer, whose shadow memory and
+// quarantine push the larger RAW/TIFF fixtures past the default.
+static const unsigned long kDefaultWorkerMemoryLimitMB = 512;
+static unsigned long g_workerMemoryLimitMB = kDefaultWorkerMemoryLimitMB;
+
+static WorkerResult launchCVEWorker(const std::string &arguments, DWORD timeout, DWORD &exitCode) {
+	char executable[32768];
+	const DWORD executableLength = GetModuleFileNameA(NULL, executable, sizeof(executable));
+	if (!executableLength || executableLength >= sizeof(executable)) return WorkerSetupFailed;
+	std::string command = quoteArgument(executable) + " " + arguments;
+	HANDLE job = CreateJobObjectA(NULL, NULL);
+	if (!job) return WorkerSetupFailed;
+	HANDLE completionPort = CreateIoCompletionPort(INVALID_HANDLE_VALUE, NULL, 0, 1);
+	if (!completionPort) {
+		CloseHandle(job);
+		return WorkerSetupFailed;
+	}
+	JOBOBJECT_ASSOCIATE_COMPLETION_PORT association = {};
+	association.CompletionKey = job;
+	association.CompletionPort = completionPort;
+	if (!SetInformationJobObject(job, JobObjectAssociateCompletionPortInformation, &association, sizeof(association))) {
+		CloseHandle(completionPort);
+		CloseHandle(job);
+		return WorkerSetupFailed;
+	}
+	JOBOBJECT_EXTENDED_LIMIT_INFORMATION limits = {};
+	limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE | JOB_OBJECT_LIMIT_PROCESS_MEMORY;
+	limits.ProcessMemoryLimit = (SIZE_T)g_workerMemoryLimitMB * 1024 * 1024;
+	if (!SetInformationJobObject(job, JobObjectExtendedLimitInformation, &limits, sizeof(limits))) {
+		CloseHandle(completionPort);
+		CloseHandle(job);
+		return WorkerSetupFailed;
+	}
+	STARTUPINFOA startup = {};
+	startup.cb = sizeof(startup);
+	PROCESS_INFORMATION process = {};
+	fflush(NULL);
+	if (!CreateProcessA(executable, &command[0], NULL, NULL, FALSE, CREATE_SUSPENDED, NULL, NULL, &startup, &process)) {
+		CloseHandle(completionPort);
+		CloseHandle(job);
+		return WorkerSetupFailed;
+	}
+	WorkerResult result = WorkerSetupFailed;
+	if (AssignProcessToJobObject(job, process.hProcess) && ResumeThread(process.hThread) != (DWORD)-1) {
+		const DWORD waitResult = WaitForSingleObject(process.hProcess, timeout);
+		if (waitResult == WAIT_TIMEOUT) {
+			result = WorkerTimedOut;
+		} else if (waitResult == WAIT_OBJECT_0 && GetExitCodeProcess(process.hProcess, &exitCode)) {
+			result = exitCode == 0 ? WorkerPassed : (exitCode <= 2 ? WorkerFailed : WorkerCrashed);
+		}
+	}
+	if (result == WorkerTimedOut || result == WorkerSetupFailed) {
+		TerminateProcess(process.hProcess, 3);
+		WaitForSingleObject(process.hProcess, INFINITE);
+	}
+	DWORD message = 0;
+	ULONG_PTR completionKey = 0;
+	LPOVERLAPPED overlapped = NULL;
+	while (GetQueuedCompletionStatus(completionPort, &message, &completionKey, &overlapped, 0)) {
+		if (message == JOB_OBJECT_MSG_PROCESS_MEMORY_LIMIT) result = WorkerResourceLimited;
+	}
+	CloseHandle(process.hThread);
+	CloseHandle(process.hProcess);
+	CloseHandle(job);
+	CloseHandle(completionPort);
+	return result;
+}
+
+static int runCVEHarnessSelfTest() {
+	const char *probes[] = {"pass", "fail", "crash", "hang", "memory-limit", "quote"};
+	const WorkerResult expected[] = {WorkerPassed, WorkerFailed, WorkerCrashed, WorkerTimedOut, WorkerResourceLimited, WorkerPassed};
+	bool passed = true;
+	for (size_t index = 0; index < sizeof(probes) / sizeof(probes[0]); ++index) {
+		DWORD exitCode = 0;
+		std::string arguments = std::string("--cve-probe ") + probes[index];
+		if (strcmp(probes[index], "quote") == 0) arguments += " " + quoteArgument("C:\\fixture root\\with\"quote\\");
+		const WorkerResult result = launchCVEWorker(arguments, 1000, exitCode);
+		const bool matched = result == expected[index];
+		printf("[%s] harness %s: result=%d exit=0x%08lX\n", matched ? "PASS" : "FAIL", probes[index], result, exitCode);
+		passed = matched && passed;
+	}
+	char temporaryDirectory[MAX_PATH];
+	char temporaryFile[MAX_PATH];
+	const DWORD directoryLength = GetTempPathA(sizeof(temporaryDirectory), temporaryDirectory);
+	if (!directoryLength || directoryLength >= sizeof(temporaryDirectory)
+		|| !GetTempFileNameA(temporaryDirectory, "cve", 0, temporaryFile)) return 1;
+	const char *filename = strrchr(temporaryFile, '\\');
+	if (!filename) {
+		DeleteFileA(temporaryFile);
+		return 1;
+	}
+	CVECase prerequisiteProbe = {"harness-prerequisites", filename + 1, FIF_BMP, 0, RejectImage, false};
+	const bool emptyRejected = !checkCVEPrerequisites(prerequisiteProbe, temporaryDirectory);
+	const bool deleted = DeleteFileA(temporaryFile) != FALSE;
+	const bool missingRejected = deleted && !checkCVEPrerequisites(prerequisiteProbe, temporaryDirectory);
+	FILE *input = fopen(temporaryFile, "wb");
+	if (!input) return 1;
+	const bool written = fputc('B', input) != EOF;
+	const bool closed = fclose(input) == 0;
+	const int previouslyEnabled = FreeImage_IsPluginEnabled(FIF_BMP);
+	FreeImage_SetPluginEnabled(FIF_BMP, FALSE);
+	const bool disabledRejected = written && closed && !checkCVEPrerequisites(prerequisiteProbe, temporaryDirectory);
+	FreeImage_SetPluginEnabled(FIF_BMP, previouslyEnabled);
+	const bool cleaned = DeleteFileA(temporaryFile) != FALSE;
+	const bool prerequisitesPassed = emptyRejected && missingRejected && disabledRejected && cleaned;
+	printf("[%s] harness empty/missing fixture and disabled decoder\n", prerequisitesPassed ? "PASS" : "FAIL");
+	passed = prerequisitesPassed && passed;
+	FIBITMAP *decoded = FreeImage_Allocate(2, 2, 24);
+	if (!decoded) return 1;
+	prerequisiteProbe.expectation = DecodeOrReject;
+	const bool acceptedDecode = checkCVEBitmap(prerequisiteProbe, decoded, "expectation-probe");
+	decoded = FreeImage_Allocate(2, 2, 24);
+	if (!decoded) return 1;
+	prerequisiteProbe.expectation = RejectImage;
+	const bool unexpectedDecodeRejected = !checkCVEBitmap(prerequisiteProbe, decoded, "expectation-probe");
+	const bool acceptedRejection = checkCVEBitmap(prerequisiteProbe, NULL, "expectation-probe");
+	const bool expectationsPassed = acceptedDecode && unexpectedDecodeRejected && acceptedRejection;
+	printf("[%s] harness bitmap expectations\n", expectationsPassed ? "PASS" : "FAIL");
+	passed = expectationsPassed && passed;
+	return passed ? 0 : 1;
+}
+#endif
+
+// Some input files are not distributed with the public source tree: the
+// third-party POC files under POCFiles/ and the CVE-2023-4799x samples, and
+// the real-world camera samples. A case that depends on one of them is
+// reported as skipped when the file is absent. Cases whose inputs are
+// generated in the worker never skip.
+static bool fixtureFileExists(const std::string &path) {
+	FILE *input = fopen(path.c_str(), "rb");
+	if (!input) return false;
+	fclose(input);
+	return true;
+}
+
+static bool isMissingOptionalFixture(const CVECase &test, const char *root) {
+	if (!test.synthetic) {
+		return !fixtureFileExists(fixturePath(test, root));
+	}
+	const char *realWorldFile = NULL;
+	if (test.synthetic == runFormatCase) {
+		if (test.variant == FMT_JPEG_REALWORLD) {
+			realWorldFile = "realworld-pentax-k20d.jpg";
+		} else if (test.variant == FMT_RAW_CR2_METADATA || test.variant == FMT_RAW_CR2_UNPROCESSED
+			|| test.variant == FMT_RAW_CR2_PROCESSED || test.variant == FMT_RAW_CR2_PROCESSED_MORE) {
+			realWorldFile = "realworld-canon-eos20d.cr2";
+		}
+	}
+	return realWorldFile && !fixtureFileExists(std::string(root) + "/" + realWorldFile);
+}
+
+static int runCVECases(const char *root, const char *selected, unsigned long timeout) {
+	unsigned passed = 0;
+	unsigned failed = 0;
+	unsigned skipped = 0;
+	for (size_t index = 0; index < sizeof(cveCases) / sizeof(cveCases[0]); ++index) {
+		const CVECase &test = cveCases[index];
+		if (selected && strcmp(selected, test.id) != 0) continue;
+		if (isMissingOptionalFixture(test, root)) {
+			printf("[SKIP] %s: input file is not distributed with the public source\n", test.id);
+			++skipped;
+			continue;
+		}
+		if (!checkCVEPrerequisites(test, root)) {
+			++failed;
+			continue;
+		}
+#ifdef WIN32
+		DWORD exitCode = 0;
+		const WorkerResult result = launchCVEWorker(std::string("--cve-worker ") + quoteArgument(test.id)
+			+ " " + quoteArgument(root), timeout, exitCode);
+		const char *status[] = {"PASS", "FAIL", "CRASH", "TIMEOUT", "HARNESS ERROR", "RESOURCE LIMIT"};
+		printf("[%s] %s (exit=0x%08lX)\n", status[result], test.id, exitCode);
+		if (result == WorkerPassed) ++passed; else ++failed;
+#else
+		printf("[FAIL] %s: isolated CVE execution currently requires Windows\n", test.id);
+		++failed;
+#endif
+	}
+	printf("CVE summary: %u passed, %u failed, %u skipped\n", passed, failed, skipped);
+	return failed == 0 && passed != 0 ? 0 : 1;
+}
+
+int runCVECommandLine(int argc, char *argv[]) {
+	if (argc < 2) return -1;
+#ifdef WIN32
+	if (strcmp(argv[1], "--cve-harness-self-test") == 0 && argc == 2) {
+		g_workerMemoryLimitMB = kDefaultWorkerMemoryLimitMB;	// the memory-limit probe allocates 513 MiB
+		return runCVEHarnessSelfTest();
+	}
+	if (strcmp(argv[1], "--cve-probe") == 0 && argc == 4 && strcmp(argv[2], "quote") == 0) {
+		return strcmp(argv[3], "C:\\fixture root\\with\"quote\\") == 0 ? 0 : 1;
+	}
+	if (strcmp(argv[1], "--cve-probe") == 0 && argc == 3) {
+		if (strcmp(argv[2], "pass") == 0) return 0;
+		if (strcmp(argv[2], "fail") == 0) return 1;
+		if (strcmp(argv[2], "memory-limit") == 0) {
+			void *allocation = VirtualAlloc(NULL, 513 * 1024 * 1024, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+			if (allocation) VirtualFree(allocation, 0, MEM_RELEASE);
+			return 0;
+		}
+		if (strcmp(argv[2], "crash") == 0) {
+			RaiseException(EXCEPTION_ACCESS_VIOLATION, EXCEPTION_NONCONTINUABLE, 0, NULL);
+			return 3;
+		}
+		if (strcmp(argv[2], "hang") == 0) {
+			HANDLE event = CreateEventA(NULL, TRUE, FALSE, NULL);
+			if (!event) return 2;
+			WaitForSingleObject(event, INFINITE);
+			CloseHandle(event);
+		}
+		return 2;
+	}
+#endif
+	if (strcmp(argv[1], "--cve-worker") == 0 && argc == 4) {
+		// Unbuffered output: when the harness kills a worker on timeout, the
+		// progress it printed so far must not be lost in the CRT buffer.
+		setvbuf(stdout, NULL, _IONBF, 0);
+		setvbuf(stderr, NULL, _IONBF, 0);
+		const CVECase *test = findCVECase(argv[2]);
+		return test ? runCVEWorker(*test, argv[3]) : 2;
+	}
+	if (strcmp(argv[1], "--list-cves") == 0 && argc == 2) {
+		for (size_t index = 0; index < sizeof(cveCases) / sizeof(cveCases[0]); ++index) {
+			const CVECase &test = cveCases[index];
+			const char *expectation = test.expectation == RejectImage ? "reject"
+				: test.expectation == DecodeRequired ? "decode-pixels"
+				: test.expectation == DecodeAny ? "decode" : "decode-or-reject";
+			printf("%s %s %s flags=%d expectation=%s detect=%s entry-points=file,memory\n",
+				test.id, test.fixture, FreeImage_GetFormatFromFIF(test.format), test.flags, expectation,
+				test.requireExactFormat ? "exact" : "any");
+		}
+		return 0;
+	}
+	if (strcmp(argv[1], "--cves") != 0) {
+		printf("Unknown test command: %s\n", argv[1]);
+		return 2;
+	}
+	const char *root = ".";
+	const char *selected = NULL;
+	unsigned long timeout = 10000;
+	for (int index = 2; index < argc; ++index) {
+		if (index + 1 >= argc) {
+			printf("Missing value for CVE option: %s\n", argv[index]);
+			return 2;
+		}
+		const char *option = argv[index];
+		const char *value = argv[++index];
+		if (strcmp(option, "--fixture-root") == 0) {
+			root = value;
+		} else if (strcmp(option, "--cve") == 0) {
+			if (!findCVECase(value)) {
+				printf("Unknown CVE: %s\n", value);
+				return 2;
+			}
+			selected = value;
+		} else if (strcmp(option, "--timeout-ms") == 0) {
+			char *end = NULL;
+			timeout = strtoul(value, &end, 10);
+			if (!value[0] || value[0] == '-' || *end || timeout == 0 || timeout > 600000) {
+				printf("CVE timeout must be an integer from 1 to 600000 milliseconds\n");
+				return 2;
+			}
+		} else if (strcmp(option, "--memory-limit-mb") == 0) {
+			char *end = NULL;
+			const unsigned long limit = strtoul(value, &end, 10);
+			if (!value[0] || value[0] == '-' || *end || limit < 64 || limit > 65536) {
+				printf("CVE worker memory limit must be an integer from 64 to 65536 MiB\n");
+				return 2;
+			}
+#ifdef WIN32
+			g_workerMemoryLimitMB = limit;
+#endif
+		} else {
+			printf("Unknown CVE option: %s\n", option);
+			return 2;
+		}
+	}
+	return runCVECases(root, selected, timeout);
+}
+
+BOOL testCVEs() {
+	return runCVECases(".", NULL, 10000) == 0;
+}
+

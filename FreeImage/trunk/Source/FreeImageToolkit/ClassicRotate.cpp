@@ -38,6 +38,14 @@
 
 #define RBLOCK		64	// image blocks of RBLOCK*RBLOCK pixels
 
+// Widest pixel the skew functions handle: FIT_RGBAF, 4 x 32-bit float. The
+// per-pixel stack buffers in HorizontalSkewT / VerticalSkewT hold this many
+// bytes whatever T is. AssignPixel copies up to 16 bytes and is inlined with
+// all of its cases, so a buffer of 4 * sizeof(T) (4 bytes for BYTE) was only
+// safe because the dispatch never passes a wider pixel for that T; MSVC could
+// not see that and reported C4789.
+#define MAX_SKEW_PIXEL_BYTES	16
+
 // --------------------------------------------------------------------------
 
 /**
@@ -58,11 +66,11 @@ HorizontalSkewT(FIBITMAP *src, FIBITMAP *dst, int row, int iOffset, double weigh
 	const unsigned src_width  = FreeImage_GetWidth(src);
 	const unsigned dst_width  = FreeImage_GetWidth(dst);
 
-	T pxlSrc[4], pxlLeft[4], pxlOldLeft[4];	// 4 = 4*sizeof(T) max
+	T pxlSrc[MAX_SKEW_PIXEL_BYTES / sizeof(T)], pxlLeft[MAX_SKEW_PIXEL_BYTES / sizeof(T)], pxlOldLeft[MAX_SKEW_PIXEL_BYTES / sizeof(T)];
 	
 	// background
-	const T pxlBlack[4] = {0, 0, 0, 0 };
-	const T *pxlBkg = static_cast<const T*>(bkcolor); // assume at least bytespp and 4*sizeof(T) max
+	const T pxlBlack[MAX_SKEW_PIXEL_BYTES / sizeof(T)] = { 0 };
+	const T *pxlBkg = static_cast<const T*>(bkcolor); // one pixel of the image type (bytespp bytes)
 	if(!pxlBkg) {
 		// default background color is black
 		pxlBkg = pxlBlack;
@@ -72,6 +80,11 @@ HorizontalSkewT(FIBITMAP *src, FIBITMAP *dst, int row, int iOffset, double weigh
 	const unsigned bytespp = FreeImage_GetLine(src) / FreeImage_GetWidth(src);
 	// calculate the number of samples per pixel
 	const unsigned samples = bytespp / sizeof(T);
+
+	// the callers only pass whole pixels of T that fit the buffers above
+	if((bytespp == 0) || (bytespp > MAX_SKEW_PIXEL_BYTES) || (bytespp % sizeof(T) != 0)) {
+		return;
+	}
 
 	BYTE *src_bits = FreeImage_GetScanLine(src, row);
 	BYTE *dst_bits = FreeImage_GetScanLine(dst, row);
@@ -189,11 +202,11 @@ VerticalSkewT(FIBITMAP *src, FIBITMAP *dst, int col, int iOffset, double weight,
 	unsigned src_height = FreeImage_GetHeight(src);
 	unsigned dst_height = FreeImage_GetHeight(dst);
 
-	T pxlSrc[4], pxlLeft[4], pxlOldLeft[4];	// 4 = 4*sizeof(T) max
+	T pxlSrc[MAX_SKEW_PIXEL_BYTES / sizeof(T)], pxlLeft[MAX_SKEW_PIXEL_BYTES / sizeof(T)], pxlOldLeft[MAX_SKEW_PIXEL_BYTES / sizeof(T)];
 
 	// background
-	const T pxlBlack[4] = {0, 0, 0, 0 };
-	const T *pxlBkg = static_cast<const T*>(bkcolor); // assume at least bytespp and 4*sizeof(T) max
+	const T pxlBlack[MAX_SKEW_PIXEL_BYTES / sizeof(T)] = { 0 };
+	const T *pxlBkg = static_cast<const T*>(bkcolor); // one pixel of the image type (bytespp bytes)
 	if(!pxlBkg) {
 		// default background color is black
 		pxlBkg = pxlBlack;
@@ -203,6 +216,11 @@ VerticalSkewT(FIBITMAP *src, FIBITMAP *dst, int col, int iOffset, double weight,
 	const unsigned bytespp = FreeImage_GetLine(src) / FreeImage_GetWidth(src);
 	// calculate the number of samples per pixel
 	const unsigned samples = bytespp / sizeof(T);
+
+	// the callers only pass whole pixels of T that fit the buffers above
+	if((bytespp == 0) || (bytespp > MAX_SKEW_PIXEL_BYTES) || (bytespp % sizeof(T) != 0)) {
+		return;
+	}
 
 	const unsigned src_pitch = FreeImage_GetPitch(src);
 	const unsigned dst_pitch = FreeImage_GetPitch(dst);
@@ -759,12 +777,10 @@ RotateAny(FIBITMAP *src, double dAngle, const void *bkcolor) {
 
 	FIBITMAP *image = src;
 
-	while(dAngle >= 360) {
-		// Bring angle to range of (-INF .. 360)
-		dAngle -= 360;
-	}
-	while(dAngle < 0) {
-		// Bring angle to range of [0 .. 360) 
+	// Bring angle to range of [0 .. 360] (fmod is exact; the caller rejects
+	// non-finite angles)
+	dAngle = fmod(dAngle, 360);
+	if(dAngle < 0) {
 		dAngle += 360;
 	}
 	if((dAngle > 45) && (dAngle <= 135)) {
@@ -826,6 +842,9 @@ RotateAny(FIBITMAP *src, double dAngle, const void *bkcolor) {
 FIBITMAP *DLL_CALLCONV 
 FreeImage_Rotate(FIBITMAP *dib, double angle, const void *bkcolor) {
 	if(!FreeImage_HasPixels(dib)) return NULL;
+
+	// an infinite angle has no rotation; NaN would size the images from NaN
+	if(!(fabs(angle) <= DBL_MAX)) return NULL;
 
 	if(0 == angle) {
 		return FreeImage_Clone(dib);

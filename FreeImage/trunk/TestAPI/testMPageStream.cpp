@@ -206,11 +206,11 @@ void testStreamMultiPage(const char *lpszPathName) {
 	assert(bSuccess);
 
 	// test multipage stream (save as)
-	bSuccess = testStreamMultiPageSave(lpszPathName, "clone-stream.tif", 0, 0);
+	bSuccess = testStreamMultiPageSave(lpszPathName, testOutputPath("clone-stream.tif").c_str(), 0, 0);
 	assert(bSuccess);
 	
 	// test multipage stream (open, modify, save as)
-	bSuccess = testStreamMultiPageOpenSave(lpszPathName, "redirect-stream.tif", 0, 0);
+	bSuccess = testStreamMultiPageOpenSave(lpszPathName, testOutputPath("redirect-stream.tif").c_str(), 0, 0);
 	assert(bSuccess);
 
 }

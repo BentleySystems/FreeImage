@@ -39,7 +39,7 @@ void test24BitsChannels(unsigned width, unsigned height) {
 	assert(src != NULL);
 
 	// save for further examination
-	bResult = FreeImage_Save(FIF_PNG, src, "zoneplate.png", PNG_DEFAULT);
+	bResult = FreeImage_Save(FIF_PNG, src, testOutputPath("zoneplate.png").c_str(), PNG_DEFAULT);
 	assert(bResult);
 
 	// test get/set channel
@@ -67,7 +67,7 @@ void test32BitsChannels(unsigned width, unsigned height) {
 	assert(src != NULL);
 
 	// save for further examination
-	bResult = FreeImage_Save(FIF_PNG, src, "zoneplate.png", PNG_DEFAULT);
+	bResult = FreeImage_Save(FIF_PNG, src, testOutputPath("zoneplate.png").c_str(), PNG_DEFAULT);
 	assert(bResult);
 
 	// test get/set channel

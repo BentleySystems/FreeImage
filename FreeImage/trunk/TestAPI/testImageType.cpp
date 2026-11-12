@@ -330,7 +330,7 @@ BOOL testLoadSaveConvertImageType(FIBITMAP *src, FREE_IMAGE_TYPE image_type) {
 		if(!dst) throw(1);
 
 		// save image as TIFF
-		bResult = FreeImage_Save(FIF_TIFF, dst, "TestImageType.tif", TIFF_DEFAULT);
+		bResult = FreeImage_Save(FIF_TIFF, dst, testOutputPath("TestImageType.tif").c_str(), TIFF_DEFAULT);
 		if(!bResult) throw(1);
 
 		// destroy dst
@@ -338,7 +338,7 @@ BOOL testLoadSaveConvertImageType(FIBITMAP *src, FREE_IMAGE_TYPE image_type) {
 		dst = NULL;
 
 		// load image
-		dst = FreeImage_Load(FIF_TIFF, "TestImageType.tif", TIFF_DEFAULT);
+		dst = FreeImage_Load(FIF_TIFF, testOutputPath("TestImageType.tif").c_str(), TIFF_DEFAULT);
 		if(!dst) throw(1);
 
 		// convert to standard bitmap (linear scaling)
@@ -348,7 +348,7 @@ BOOL testLoadSaveConvertImageType(FIBITMAP *src, FREE_IMAGE_TYPE image_type) {
 		dst = NULL;
 
 		// save image as TIFF
-		bResult = FreeImage_Save(FIF_TIFF, chk, "TestImageType.tif", TIFF_DEFAULT);
+		bResult = FreeImage_Save(FIF_TIFF, chk, testOutputPath("TestImageType.tif").c_str(), TIFF_DEFAULT);
 		if(!bResult) throw(1);
 		FreeImage_Unload(chk);
 		chk = NULL;
@@ -375,7 +375,7 @@ BOOL testLoadSaveConvertComplexType(FIBITMAP *src, FREE_IMAGE_COLOR_CHANNEL chan
 		if(!dst) throw(1);
 
 		// save image as TIFF
-		bResult = FreeImage_Save(FIF_TIFF, dst, "TestImageType.tif", TIFF_DEFAULT);
+		bResult = FreeImage_Save(FIF_TIFF, dst, testOutputPath("TestImageType.tif").c_str(), TIFF_DEFAULT);
 		if(!bResult) throw(1);
 
 		// destroy dst
@@ -383,7 +383,7 @@ BOOL testLoadSaveConvertComplexType(FIBITMAP *src, FREE_IMAGE_COLOR_CHANNEL chan
 		dst = NULL;
 
 		// load image
-		dst = FreeImage_Load(FIF_TIFF, "TestImageType.tif", TIFF_DEFAULT);
+		dst = FreeImage_Load(FIF_TIFF, testOutputPath("TestImageType.tif").c_str(), TIFF_DEFAULT);
 		if(!dst) throw(1);
 
 		
@@ -400,7 +400,7 @@ BOOL testLoadSaveConvertComplexType(FIBITMAP *src, FREE_IMAGE_COLOR_CHANNEL chan
 		chk_double = NULL;
 
 		// save image as TIFF
-		bResult = FreeImage_Save(FIF_TIFF, chk, "TestImageType.tif", TIFF_DEFAULT);
+		bResult = FreeImage_Save(FIF_TIFF, chk, testOutputPath("TestImageType.tif").c_str(), TIFF_DEFAULT);
 		if(!bResult) throw(1);
 		FreeImage_Unload(chk);
 		chk = NULL;
@@ -461,7 +461,7 @@ void testImageTypeTIFF(unsigned width, unsigned height) {
 	assert(src != NULL);
 
 	// save for further examination
-	bResult = FreeImage_Save(FIF_PNG, src, "zoneplate.png", PNG_DEFAULT);
+	bResult = FreeImage_Save(FIF_PNG, src, testOutputPath("zoneplate.png").c_str(), PNG_DEFAULT);
 	assert(bResult);
 
 	// test load /save / convert

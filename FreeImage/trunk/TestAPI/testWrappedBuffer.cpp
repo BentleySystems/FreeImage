@@ -70,7 +70,7 @@ static void testViewport(FIBITMAP *dib) {
 	src = FreeImage_ConvertFromRawBitsEx(FALSE/*copySource*/, data, FIT_BITMAP, vp_width, vp_height, FreeImage_GetPitch(dib), FreeImage_GetBPP(dib), FI_RGBA_RED_MASK, FI_RGBA_GREEN_MASK, FI_RGBA_BLUE_MASK);
 
 	// save the section (note that the image is inverted due to previous processing)
-	FreeImage_Save(FIF_PNG, src, "viewport.png");
+	FreeImage_Save(FIF_PNG, src, testOutputPath("viewport.png").c_str());
 	
 	// unload the wrapper
 	FreeImage_Unload(src);
@@ -154,7 +154,7 @@ void testCreateView(const char *lpszPathName, int flags) {
 	assert(FreeImage_GetBPP(view) == bpp);
 
 	// save as BMP - check correct pitch handling
-	FreeImage_Save(FIF_BMP, view, "test_view.bmp", 0);
+	FreeImage_Save(FIF_BMP, view, testOutputPath("test_view.bmp").c_str(), 0);
 
 	// no longer needed
 	FreeImage_Unload(view);

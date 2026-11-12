@@ -232,7 +232,7 @@ public:
 		if (_ptr >= _end) {
 			// need refill
 			_ptr = _begin;
-			_io->read_proc(_ptr, sizeof(BYTE), (unsigned)_size, _handle);	//### EOF - no problem?
+			refill();
 		}
 
 		BYTE result = *_ptr;
@@ -244,6 +244,10 @@ public:
 	
 	inline
 	BYTE* getBytes(size_t count /*must be < _size!*/) {
+		// a request that cannot fit in the cache would read past the buffer
+		if (count >= _size) {
+			return NULL;
+		}
 		if (_ptr + count >= _end) {
 			
 			// need refill
@@ -257,7 +261,7 @@ public:
 			_io->seek_proc(_handle, -remaining, SEEK_CUR);
 
 			_ptr = _begin;
-			_io->read_proc(_ptr, sizeof(BYTE), (unsigned)_size, _handle);	//### EOF - no problem?
+			refill();
 		}
 
 		BYTE *result = _ptr;
@@ -268,6 +272,14 @@ public:
 	}
 
 private:
+	/// Read a full cache block; bytes past EOF are zeroed so no stale or uninitialized data is decoded.
+	void refill() {
+		const unsigned got = _io->read_proc(_begin, sizeof(BYTE), (unsigned)_size, _handle);
+		if (got < _size) {
+			memset(_begin + got, 0, _size - got);
+		}
+	}
+
 	IOCache& operator=(const IOCache& src); // deleted
 	IOCache(const IOCache& other); // deleted
 
@@ -584,8 +596,9 @@ loadRLE(FIBITMAP*& dib, int width, int height, FreeImageIO* io, fi_handle handle
 	BYTE rle;
 	BYTE *line_bits;
 
-	// this is used to guard against writing beyond the end of the image (on corrupted rle block)
-	const BYTE* dib_end = FreeImage_GetScanLine(dib, height);//< one-past-end row
+	if (width <= 0 || height <= 0 || line_size < pixel_size) {
+		throw FI_MSG_ERROR_CORRUPTED;
+	}
 
 	// Compute the rough size of a line...
 	const long pixels_offset = io->tell_proc(handle);
@@ -593,16 +606,20 @@ loadRLE(FIBITMAP*& dib, int width, int height, FreeImageIO* io, fi_handle handle
 	if (remaining_size < height) {
 		throw FI_MSG_ERROR_CORRUPTED;
 	}
-	const long sz = (remaining_size / height);
+	// ...and allocate cache of this size (yields good results).
+	// The cache must be larger than one file pixel, or getBytes() cannot serve a pixel.
+	const long kMinCacheSize = 1024;
+	const long sz = MAX(remaining_size / height, kMinCacheSize);
 
-	// ...and allocate cache of this size (yields good results)
 	IOCache cache(io, handle, sz);
 	if(cache.isNull()) {
 		FreeImage_Unload(dib);
 		dib = NULL;
 		return;
 	}
-		
+
+	// Pixels are written only while (y < height) and (x + pixel_size <= line_size),
+	// so a corrupt packet count can never write outside the bitmap (CVE-2024-28581).
 	int x = 0, y = 0;
 
 	line_bits = FreeImage_GetScanLine(dib, y);
@@ -614,50 +631,42 @@ loadRLE(FIBITMAP*& dib, int width, int height, FreeImageIO* io, fi_handle handle
 		BOOL has_rle = rle & 0x80;
 		rle &= ~0x80; // remove type-bit
 
-		BYTE packet_count = rle + 1;
+		const int packet_count = rle + 1;
 
-		//packet_count might be corrupt, test if we are not about to write beyond the last image bit
-
-		if ((line_bits+x) + packet_count*pixel_size > dib_end) {
-			FreeImage_OutputMessageProc(s_format_id, FI_MSG_ERROR_CORRUPTED);
-			// return what is left from the bitmap
-			return;
+		BYTE *val = NULL;
+		if (has_rle) {
+			// read a pixel value from file, used for the whole packet
+			val = cache.getBytes(file_pixel_size);
+			if (!val) {
+				throw FI_MSG_ERROR_CORRUPTED;
+			}
 		}
 
-		if (has_rle) {
-
-			// read a pixel value from file...
-			BYTE *val = cache.getBytes(file_pixel_size);
-
-			//...and fill packet_count pixels with it
-
-			for (int ix = 0; ix < packet_count; ix++) {
-				_assignPixel<bPP>((line_bits+x), val, as24bit);
-				x += pixel_size;
-
-				if (x >= line_size) {
-					x = 0;
-					y++;
-					line_bits = FreeImage_GetScanLine(dib, y);
+		for (int ix = 0; ix < packet_count; ix++) {
+			if (!has_rle) {
+				// no rle compression: copy the next pixel from file to dib
+				val = cache.getBytes(file_pixel_size);
+				if (!val) {
+					throw FI_MSG_ERROR_CORRUPTED;
 				}
 			}
 
-		} else {
-			// no rle commpresion
+			_assignPixel<bPP>((line_bits+x), val, as24bit);
+			x += pixel_size;
 
-			// copy packet_count pixels from file to dib
-			for (int ix = 0; ix < packet_count; ix++) {
-				BYTE *val = cache.getBytes(file_pixel_size);
-				_assignPixel<bPP>((line_bits+x), val, as24bit);
-				x += pixel_size;
-
-				if (x >= line_size) {
-					x = 0;
-					y++;
-					line_bits = FreeImage_GetScanLine(dib, y);
+			if (x + pixel_size > line_size) {
+				x = 0;
+				y++;
+				if (y >= height) {
+					if (ix + 1 < packet_count) {
+						// packet runs past the last row: keep what was decoded
+						FreeImage_OutputMessageProc(s_format_id, FI_MSG_ERROR_CORRUPTED);
+					}
+					return;
 				}
-			} //< packet_count
-		} //< has_rle
+				line_bits = FreeImage_GetScanLine(dib, y);
+			}
+		} //< packet_count
 
 	} //< while height
 

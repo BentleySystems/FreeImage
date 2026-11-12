@@ -1,5 +1,5 @@
-libpng 1.6.43 - February 23, 2024
-=================================
+libpng 1.6.59 - September 28, 2026
+==================================
 
 This is a public release of libpng, intended for use in production code.
 
@@ -7,15 +7,12 @@ This is a public release of libpng, intended for use in production code.
 Files available for download
 ----------------------------
 
-Source files with LF line endings (for Unix/Linux):
+Source files:
 
- * libpng-1.6.43.tar.xz (LZMA-compressed, recommended)
- * libpng-1.6.43.tar.gz (deflate-compressed)
-
-Source files with CRLF line endings (for Windows):
-
- * lpng1643.7z (LZMA-compressed, recommended)
- * lpng1643.zip (deflate-compressed)
+ * libpng-1.6.59.tar.xz (LZMA-compressed, recommended)
+ * libpng-1.6.59.tar.gz (deflate-compressed)
+ * lpng1659.7z (LZMA-compressed)
+ * lpng1659.zip (deflate-compressed)
 
 Other information:
 
@@ -25,39 +22,24 @@ Other information:
  * TRADEMARK.md
 
 
-Changes from version 1.6.42 to version 1.6.43
+Changes from version 1.6.58 to version 1.6.59
 ---------------------------------------------
 
- * Fixed the row width check in png_check_IHDR().
-   This corrected a bug that was specific to the 16-bit platforms,
-   and removed a spurious compiler warning from the 64-bit builds.
-   (Reported by Jacek Caban; fixed by John Bowler)
- * Added eXIf chunk support to the push-mode reader in pngpread.c.
-   (Contributed by Chris Blume)
- * Added contrib/pngexif for the benefit of the users who would like
-   to inspect the content of eXIf chunks.
- * Added contrib/conftest/basic.dfa, a basic build-time configuration.
-   (Contributed by John Bowler)
- * Fixed a preprocessor condition in pngread.c that broke build-time
-   configurations like contrib/conftest/pngcp.dfa.
-   (Contributed by John Bowler)
- * Added CMake build support for LoongArch LSX.
-   (Contributed by GuXiWei)
- * Fixed a CMake build error that occurred under a peculiar state of the
-   dependency tree. This was a regression introduced in libpng-1.6.41.
-   (Contributed by Dan Rosser)
- * Marked the installed libpng headers as system headers in CMake.
-   (Contributed by Benjamin Buch)
- * Updated the build support for RISCOS.
-   (Contributed by Cameron Cawley)
- * Updated the makefiles to allow cross-platform builds to initialize
-   conventional make variables like AR and ARFLAGS.
- * Added various improvements to the CI scripts in areas like version
-   consistency verification and text linting.
- * Added version consistency verification to pngtest.c also.
+ * Fixed CVE-2026-46675 (medium severity):
+   Use-after-free of zlib input in `png_read_end` after incomplete zTXt, iTXt
+   or iCCP decompression.
+   (Reported independently by Ze Sheng and
+   <JasonHonKL@users.noreply.github.com>.)
+ * Fixed a regression introduced in version 1.6.47 that caused libpng to reject
+   hIST chunks in their correct position, after PLTE.
+   (Contributed by Yuki Sekiguchi.)
+ * Prevented a double free of `png_struct` members after an allocation failure.
+   (Contributed by Anthony Hurtado.)
+ * Applied fixes and updates to the CMake build.
+ * Adopted the REUSE Specification for licensing the CI files.
 
 
 Send comments/corrections/commendations to png-mng-implement at lists.sf.net.
 Subscription is required; visit
-https://lists.sourceforge.net/lists/listinfo/png-mng-implement
+<https://lists.sourceforge.net/lists/listinfo/png-mng-implement>
 to subscribe.

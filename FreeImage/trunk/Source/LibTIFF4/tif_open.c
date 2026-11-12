@@ -37,7 +37,7 @@
 /*
  * Dummy functions to fill the omitted client procedures.
  */
-static int _tiffDummyMapProc(thandle_t fd, void **pbase, toff_t *psize)
+int _tiffDummyMapProc(thandle_t fd, void **pbase, toff_t *psize)
 {
     (void)fd;
     (void)pbase;
@@ -45,7 +45,7 @@ static int _tiffDummyMapProc(thandle_t fd, void **pbase, toff_t *psize)
     return (0);
 }
 
-static void _tiffDummyUnmapProc(thandle_t fd, void *base, toff_t size)
+void _tiffDummyUnmapProc(thandle_t fd, void *base, toff_t size)
 {
     (void)fd;
     (void)base;
@@ -77,7 +77,7 @@ int _TIFFgetMode(TIFFOpenOptions *opts, thandle_t clientdata, const char *mode,
     return (m);
 }
 
-TIFFOpenOptions *TIFFOpenOptionsAlloc()
+TIFFOpenOptions *TIFFOpenOptionsAlloc(void)
 {
     TIFFOpenOptions *opts =
         (TIFFOpenOptions *)_TIFFcalloc(1, sizeof(TIFFOpenOptions));
@@ -107,6 +107,15 @@ void TIFFOpenOptionsSetMaxCumulatedMemAlloc(TIFFOpenOptions *opts,
                                             tmsize_t max_cumulated_mem_alloc)
 {
     opts->max_cumulated_mem_alloc = max_cumulated_mem_alloc;
+}
+
+/** Whether a warning should be emitted when encountering a unknown tag.
+ * Default is FALSE since libtiff 4.7.1
+ */
+void TIFFOpenOptionsSetWarnAboutUnknownTags(TIFFOpenOptions *opts,
+                                            int warn_about_unknown_tags)
+{
+    opts->warn_about_unknown_tags = warn_about_unknown_tags;
 }
 
 void TIFFOpenOptionsSetErrorHandlerExtR(TIFFOpenOptions *opts,
@@ -299,6 +308,7 @@ TIFF *TIFFClientOpenExt(const char *name, const char *mode,
     TIFF *tif;
     int m;
     const char *cp;
+    tmsize_t size_to_alloc;
 
     /* The following are configuration checks. They should be redundant, but
      * should not compile to any actual code in an optimised release build
@@ -321,7 +331,7 @@ TIFF *TIFFClientOpenExt(const char *name, const char *mode,
         n.a8[0] = 1;
         n.a8[1] = 0;
         (void)n;
-#ifdef WORDS_BIGENDIAN
+#if WORDS_BIGENDIAN
         assert(n.a16 == 256);
 #else
         assert(n.a16 == 1);
@@ -331,7 +341,7 @@ TIFF *TIFFClientOpenExt(const char *name, const char *mode,
     m = _TIFFgetMode(opts, clientdata, mode, module);
     if (m == -1)
         goto bad2;
-    tmsize_t size_to_alloc = (tmsize_t)(sizeof(TIFF) + strlen(name) + 1);
+    size_to_alloc = (tmsize_t)(sizeof(TIFF) + strlen(name) + 1);
     if (opts && opts->max_single_mem_alloc > 0 &&
         size_to_alloc > opts->max_single_mem_alloc)
     {
@@ -366,9 +376,8 @@ TIFF *TIFFClientOpenExt(const char *name, const char *mode,
     strcpy(tif->tif_name, name);
     tif->tif_mode = m & ~(O_CREAT | O_TRUNC);
     tif->tif_curdir = TIFF_NON_EXISTENT_DIR_NUMBER; /* non-existent directory */
+    tif->tif_curdircount = TIFF_NON_EXISTENT_DIR_NUMBER;
     tif->tif_curoff = 0;
-    tif->tif_curstrip = (uint32_t)-1; /* invalid strip */
-    tif->tif_row = (uint32_t)-1;      /* read/write pre-increment */
     tif->tif_clientdata = clientdata;
     tif->tif_readproc = readproc;
     tif->tif_writeproc = writeproc;
@@ -385,7 +394,12 @@ TIFF *TIFFClientOpenExt(const char *name, const char *mode,
         tif->tif_warnhandler_user_data = opts->warnhandler_user_data;
         tif->tif_max_single_mem_alloc = opts->max_single_mem_alloc;
         tif->tif_max_cumulated_mem_alloc = opts->max_cumulated_mem_alloc;
+        tif->tif_warn_about_unknown_tags = opts->warn_about_unknown_tags;
     }
+
+    /* Reset tif->tif_dir structure to zero and
+     * initialize some IFD strile counter and index parameters. */
+    _TIFFResetTifDirAndInitStrileCounters(&tif->tif_dir);
 
     if (!readproc || !writeproc || !seekproc || !closeproc || !sizeproc)
     {
@@ -469,13 +483,13 @@ TIFF *TIFFClientOpenExt(const char *name, const char *mode,
         switch (*cp)
         {
             case 'b':
-#ifndef WORDS_BIGENDIAN
+#if !WORDS_BIGENDIAN
                 if (m & O_CREAT)
                     tif->tif_flags |= TIFF_SWAB;
 #endif
                 break;
             case 'l':
-#ifdef WORDS_BIGENDIAN
+#if WORDS_BIGENDIAN
                 if ((m & O_CREAT))
                     tif->tif_flags |= TIFF_SWAB;
 #endif
@@ -525,7 +539,9 @@ TIFF *TIFFClientOpenExt(const char *name, const char *mode,
             case 'O':
                 if (m == O_RDONLY)
                     tif->tif_flags |=
-                        (TIFF_LAZYSTRILELOAD | TIFF_DEFERSTRILELOAD);
+                        (TIFF_LAZYSTRILELOAD_ASKED | TIFF_DEFERSTRILELOAD);
+                break;
+            default:
                 break;
         }
 
@@ -547,23 +563,27 @@ TIFF *TIFFClientOpenExt(const char *name, const char *mode,
             TIFFErrorExtR(tif, name, "Cannot read TIFF header");
             goto bad;
         }
-/*
- * Setup header and write.
- */
-#ifdef WORDS_BIGENDIAN
+        /*
+         * Setup header and write.
+         */
+#if WORDS_BIGENDIAN
         tif->tif_header.common.tiff_magic =
             (tif->tif_flags & TIFF_SWAB) ? TIFF_LITTLEENDIAN : TIFF_BIGENDIAN;
 #else
         tif->tif_header.common.tiff_magic =
             (tif->tif_flags & TIFF_SWAB) ? TIFF_BIGENDIAN : TIFF_LITTLEENDIAN;
 #endif
+        TIFFHeaderUnion tif_header_swapped;
         if (!(tif->tif_flags & TIFF_BIGTIFF))
         {
             tif->tif_header.common.tiff_version = TIFF_VERSION_CLASSIC;
             tif->tif_header.classic.tiff_diroff = 0;
-            if (tif->tif_flags & TIFF_SWAB)
-                TIFFSwabShort(&tif->tif_header.common.tiff_version);
             tif->tif_header_size = sizeof(TIFFHeaderClassic);
+            /* Swapped copy for writing */
+            _TIFFmemcpy(&tif_header_swapped, &tif->tif_header,
+                        sizeof(TIFFHeaderUnion));
+            if (tif->tif_flags & TIFF_SWAB)
+                TIFFSwabShort(&tif_header_swapped.common.tiff_version);
         }
         else
         {
@@ -571,12 +591,15 @@ TIFF *TIFFClientOpenExt(const char *name, const char *mode,
             tif->tif_header.big.tiff_offsetsize = 8;
             tif->tif_header.big.tiff_unused = 0;
             tif->tif_header.big.tiff_diroff = 0;
+            tif->tif_header_size = sizeof(TIFFHeaderBig);
+            /* Swapped copy for writing */
+            _TIFFmemcpy(&tif_header_swapped, &tif->tif_header,
+                        sizeof(TIFFHeaderUnion));
             if (tif->tif_flags & TIFF_SWAB)
             {
-                TIFFSwabShort(&tif->tif_header.common.tiff_version);
-                TIFFSwabShort(&tif->tif_header.big.tiff_offsetsize);
+                TIFFSwabShort(&tif_header_swapped.common.tiff_version);
+                TIFFSwabShort(&tif_header_swapped.big.tiff_offsetsize);
             }
-            tif->tif_header_size = sizeof(TIFFHeaderBig);
         }
         /*
          * The doc for "fopen" for some STD_C_LIBs says that if you
@@ -586,25 +609,11 @@ TIFF *TIFFClientOpenExt(const char *name, const char *mode,
          * on Solaris.
          */
         TIFFSeekFile(tif, 0, SEEK_SET);
-        if (!WriteOK(tif, &tif->tif_header, (tmsize_t)(tif->tif_header_size)))
+        if (!WriteOK(tif, &tif_header_swapped,
+                     (tmsize_t)(tif->tif_header_size)))
         {
             TIFFErrorExtR(tif, name, "Error writing TIFF header");
             goto bad;
-        }
-        /*
-         * Setup the byte order handling.
-         */
-        if (tif->tif_header.common.tiff_magic == TIFF_BIGENDIAN)
-        {
-#ifndef WORDS_BIGENDIAN
-            tif->tif_flags |= TIFF_SWAB;
-#endif
-        }
-        else
-        {
-#ifdef WORDS_BIGENDIAN
-            tif->tif_flags |= TIFF_SWAB;
-#endif
         }
         /*
          * Setup default directory.
@@ -614,10 +623,14 @@ TIFF *TIFFClientOpenExt(const char *name, const char *mode,
         tif->tif_diroff = 0;
         tif->tif_lastdiroff = 0;
         tif->tif_setdirectory_force_absolute = FALSE;
+        /* tif_curdircount = 0 means 'empty file opened for writing, but no IFD
+         * written yet' */
+        tif->tif_curdircount = 0;
         return (tif);
     }
+
     /*
-     * Setup the byte order handling.
+     * Setup the byte order handling according to the opened file for reading.
      */
     if (tif->tif_header.common.tiff_magic != TIFF_BIGENDIAN &&
         tif->tif_header.common.tiff_magic != TIFF_LITTLEENDIAN
@@ -646,13 +659,13 @@ TIFF *TIFFClientOpenExt(const char *name, const char *mode,
     }
     if (tif->tif_header.common.tiff_magic == TIFF_BIGENDIAN)
     {
-#ifndef WORDS_BIGENDIAN
+#if !WORDS_BIGENDIAN
         tif->tif_flags |= TIFF_SWAB;
 #endif
     }
     else
     {
-#ifdef WORDS_BIGENDIAN
+#if WORDS_BIGENDIAN
         tif->tif_flags |= TIFF_SWAB;
 #endif
     }
@@ -743,9 +756,17 @@ TIFF *TIFFClientOpenExt(const char *name, const char *mode,
              * example, it may be broken) and want to proceed to other
              * directories. I this case we use the TIFF_HEADERONLY flag to open
              * file and return immediately after reading TIFF header.
+             * However, the pointer to TIFFSetField() and TIFFGetField()
+             * (i.e. tif->tif_tagmethods.vsetfield and
+             * tif->tif_tagmethods.vgetfield) need to be initialized, which is
+             * done in TIFFDefaultDirectory().
              */
             if (tif->tif_flags & TIFF_HEADERONLY)
+            {
+                if (!TIFFDefaultDirectory(tif))
+                    goto bad;
                 return (tif);
+            }
 
             /*
              * Setup initial directory.
@@ -764,6 +785,8 @@ TIFF *TIFFClientOpenExt(const char *name, const char *mode,
             if (!TIFFDefaultDirectory(tif))
                 goto bad;
             return (tif);
+        default:
+            break;
     }
 bad:
     tif->tif_mode = O_RDONLY; /* XXX avoid flush */
@@ -845,7 +868,7 @@ int TIFFIsTiled(TIFF *tif) { return (isTiled(tif)); }
 /*
  * Return current row being read/written.
  */
-uint32_t TIFFCurrentRow(TIFF *tif) { return (tif->tif_row); }
+uint32_t TIFFCurrentRow(TIFF *tif) { return (tif->tif_dir.td_row); }
 
 /*
  * Return index of the current directory.
@@ -855,12 +878,12 @@ tdir_t TIFFCurrentDirectory(TIFF *tif) { return (tif->tif_curdir); }
 /*
  * Return current strip.
  */
-uint32_t TIFFCurrentStrip(TIFF *tif) { return (tif->tif_curstrip); }
+uint32_t TIFFCurrentStrip(TIFF *tif) { return (tif->tif_dir.td_curstrip); }
 
 /*
  * Return current tile.
  */
-uint32_t TIFFCurrentTile(TIFF *tif) { return (tif->tif_curtile); }
+uint32_t TIFFCurrentTile(TIFF *tif) { return (tif->tif_dir.td_curtile); }
 
 /*
  * Return nonzero if the file has byte-swapped data.

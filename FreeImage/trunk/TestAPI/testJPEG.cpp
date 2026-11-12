@@ -31,36 +31,36 @@ void testJPEGTransform(const char *src_file) {
 
 	// perfect transformation
 	perfect = TRUE;
-	bResult = FreeImage_JPEGTransform(src_file, "test.jpg", FIJPEG_OP_FLIP_H, perfect);
+	bResult = FreeImage_JPEGTransform(src_file, testOutputPath("test.jpg").c_str(), FIJPEG_OP_FLIP_H, perfect);
 	assert(bResult == FALSE);
-	bResult = FreeImage_JPEGTransform(src_file, "test.jpg", FIJPEG_OP_FLIP_V, perfect);
+	bResult = FreeImage_JPEGTransform(src_file, testOutputPath("test.jpg").c_str(), FIJPEG_OP_FLIP_V, perfect);
 	assert(bResult);
-	bResult = FreeImage_JPEGTransform(src_file, "test.jpg", FIJPEG_OP_TRANSPOSE, perfect);
+	bResult = FreeImage_JPEGTransform(src_file, testOutputPath("test.jpg").c_str(), FIJPEG_OP_TRANSPOSE, perfect);
 	assert(bResult);
-	bResult = FreeImage_JPEGTransform(src_file, "test.jpg", FIJPEG_OP_TRANSVERSE, perfect);
+	bResult = FreeImage_JPEGTransform(src_file, testOutputPath("test.jpg").c_str(), FIJPEG_OP_TRANSVERSE, perfect);
 	assert(bResult == FALSE);
-	bResult = FreeImage_JPEGTransform(src_file, "test.jpg", FIJPEG_OP_ROTATE_90, perfect);
+	bResult = FreeImage_JPEGTransform(src_file, testOutputPath("test.jpg").c_str(), FIJPEG_OP_ROTATE_90, perfect);
 	assert(bResult);
-	bResult = FreeImage_JPEGTransform(src_file, "test.jpg", FIJPEG_OP_ROTATE_180, perfect);
+	bResult = FreeImage_JPEGTransform(src_file, testOutputPath("test.jpg").c_str(), FIJPEG_OP_ROTATE_180, perfect);
 	assert(bResult == FALSE);
-	bResult = FreeImage_JPEGTransform(src_file, "test.jpg", FIJPEG_OP_ROTATE_270, perfect);
+	bResult = FreeImage_JPEGTransform(src_file, testOutputPath("test.jpg").c_str(), FIJPEG_OP_ROTATE_270, perfect);
 	assert(bResult == FALSE);
 
 	// non perfect transformation
 	perfect = FALSE;
-	bResult = FreeImage_JPEGTransform(src_file, "test.jpg", FIJPEG_OP_FLIP_H, perfect);
+	bResult = FreeImage_JPEGTransform(src_file, testOutputPath("test.jpg").c_str(), FIJPEG_OP_FLIP_H, perfect);
 	assert(bResult);
-	bResult = FreeImage_JPEGTransform(src_file, "test.jpg", FIJPEG_OP_FLIP_V, perfect);
+	bResult = FreeImage_JPEGTransform(src_file, testOutputPath("test.jpg").c_str(), FIJPEG_OP_FLIP_V, perfect);
 	assert(bResult);
-	bResult = FreeImage_JPEGTransform(src_file, "test.jpg", FIJPEG_OP_TRANSPOSE, perfect);
+	bResult = FreeImage_JPEGTransform(src_file, testOutputPath("test.jpg").c_str(), FIJPEG_OP_TRANSPOSE, perfect);
 	assert(bResult);
-	bResult = FreeImage_JPEGTransform(src_file, "test.jpg", FIJPEG_OP_TRANSVERSE, perfect);
+	bResult = FreeImage_JPEGTransform(src_file, testOutputPath("test.jpg").c_str(), FIJPEG_OP_TRANSVERSE, perfect);
 	assert(bResult);
-	bResult = FreeImage_JPEGTransform(src_file, "test.jpg", FIJPEG_OP_ROTATE_90, perfect);
+	bResult = FreeImage_JPEGTransform(src_file, testOutputPath("test.jpg").c_str(), FIJPEG_OP_ROTATE_90, perfect);
 	assert(bResult);
-	bResult = FreeImage_JPEGTransform(src_file, "test.jpg", FIJPEG_OP_ROTATE_180, perfect);
+	bResult = FreeImage_JPEGTransform(src_file, testOutputPath("test.jpg").c_str(), FIJPEG_OP_ROTATE_180, perfect);
 	assert(bResult);
-	bResult = FreeImage_JPEGTransform(src_file, "test.jpg", FIJPEG_OP_ROTATE_270, perfect);
+	bResult = FreeImage_JPEGTransform(src_file, testOutputPath("test.jpg").c_str(), FIJPEG_OP_ROTATE_270, perfect);
 	assert(bResult);
 
 }
@@ -71,12 +71,12 @@ void testJPEGCrop(const char *src_file) {
 
 	// perfect transformation
 	left = 50; top = 100; right = 359; bottom = 354;
-	bResult = FreeImage_JPEGCrop(src_file, "test.jpg", left, top, right, bottom);
+	bResult = FreeImage_JPEGCrop(src_file, testOutputPath("test.jpg").c_str(), left, top, right, bottom);
 	assert(bResult);
 
 	// non perfect transformation (crop rectangle is adjusted automatically)
 	left = 50; top = 100; right = 650; bottom = 500;
-	bResult = FreeImage_JPEGCrop(src_file, "test.jpg", left, top, right, bottom);
+	bResult = FreeImage_JPEGCrop(src_file, testOutputPath("test.jpg").c_str(), left, top, right, bottom);
 	assert(bResult);
 }
 
@@ -188,9 +188,9 @@ void testJPEGSameFile(const char *src_file) {
 
 	// perfect transformation
 	perfect = TRUE;
-	bResult = FreeImage_JPEGTransform(src_file, "test.jpg", FIJPEG_OP_ROTATE_90, perfect);
+	bResult = FreeImage_JPEGTransform(src_file, testOutputPath("test.jpg").c_str(), FIJPEG_OP_ROTATE_90, perfect);
 	assert(bResult);
-	bResult = FreeImage_JPEGTransform("test.jpg", "test.jpg", FIJPEG_OP_ROTATE_270, perfect);
+	bResult = FreeImage_JPEGTransform(testOutputPath("test.jpg").c_str(), testOutputPath("test.jpg").c_str(), FIJPEG_OP_ROTATE_270, perfect);
 	assert(bResult);
 }
 
@@ -209,7 +209,7 @@ void testJPEG() {
 	testJPEGCrop(src_file);
 
 	// lossless transform + cropping - both perfect/non perfect
-	testJPEGTransformCombined(src_file, "test.jpg");
+	testJPEGTransformCombined(src_file, testOutputPath("test.jpg").c_str());
 
 	// using the same file for src & dst is allowed
 	testJPEGSameFile(src_file);

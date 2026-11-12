@@ -213,6 +213,48 @@ FreeImage_GetPluginList() {
 }
 
 // =====================================================================
+// Legacy codecs
+// =====================================================================
+
+/**
+Switches off the codecs for formats this build does not consume (KOALA, IFF/LBM,
+MNG, PCD, CUT, FAXG3, SGI, PICT, the PNM family PBM/PGM/PPM, PFM, PCX, DDS and ICO).
+They are old decoders, several recognise files by weak or no signature, so
+content detection could route an unrelated file to one of them.
+
+The plugins stay registered because a format's identifier is its registration
+index and must keep matching the FREE_IMAGE_FORMAT enum. Each is disabled (so
+detection by content, extension, format name and MIME type skips it) and its
+load, save and capability entry points are removed (so an explicit FreeImage_Load(fif, ...)
+or a later FreeImage_SetPluginEnabled(fif, TRUE) cannot reach the decoder),
+the same way the PSD, RAS, XBM and XPM codecs are already recognition-only.
+
+Build with FREEIMAGE_KEEP_LEGACY_CODECS defined to keep them.
+*/
+static void
+DisableLegacyCodecs() {
+	static const FREE_IMAGE_FORMAT legacy[] = {
+		FIF_KOALA, FIF_LBM, FIF_MNG, FIF_PCD, FIF_CUT, FIF_FAXG3, FIF_SGI, FIF_PICT,
+		FIF_PBM, FIF_PBMRAW, FIF_PGM, FIF_PGMRAW, FIF_PPM, FIF_PPMRAW, FIF_PFM,
+		FIF_PCX, FIF_DDS, FIF_ICO
+	};
+
+	for (size_t i = 0; i < sizeof(legacy) / sizeof(legacy[0]); i++) {
+		PluginNode *node = s_plugins->FindNodeFromFIF(legacy[i]);
+
+		if (node != NULL) {
+			node->m_enabled = FALSE;
+			node->m_plugin->load_proc = NULL;
+			node->m_plugin->save_proc = NULL;
+			node->m_plugin->supports_export_bpp_proc = NULL;
+			node->m_plugin->supports_export_type_proc = NULL;
+			node->m_plugin->supports_icc_profiles_proc = NULL;
+			node->m_plugin->supports_no_pixels_proc = NULL;
+		}
+	}
+}
+
+// =====================================================================
 // Plugin System Initialization
 // =====================================================================
 
@@ -274,6 +316,10 @@ FreeImage_Initialise(BOOL load_local_plugins_only) {
 			s_plugins->AddNode(InitRAW);
 			s_plugins->AddNode(InitWEBP);
 			s_plugins->AddNode(InitJXR);
+
+#ifndef FREEIMAGE_KEEP_LEGACY_CODECS
+			DisableLegacyCodecs();
+#endif
 			
 			// external plugin initialization
 

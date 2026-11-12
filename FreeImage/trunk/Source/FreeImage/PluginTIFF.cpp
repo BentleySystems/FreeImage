@@ -39,7 +39,7 @@
 #include "Utilities.h"
 #include "../LibTIFF4/tiffiop.h"
 #include "../Metadata/FreeImageTag.h"
-#include "../OpenEXR/Half/half.h"
+#include <Imath/half.h>
 
 #include "FreeImageIO.h"
 #include "PSDParser.h"
@@ -365,6 +365,12 @@ Fill the dib palette according to the TIFF photometric
 static void 
 ReadPalette(TIFF *tiff, uint16_t photometric, uint16_t bitspersample, FIBITMAP *dib) {
 	RGBQUAD *pal = FreeImage_GetPalette(dib);
+	if(!pal) {
+		if(photometric == PHOTOMETRIC_PALETTE) {
+			throw "Invalid TIFF palette";
+		}
+		return;
+	}
 
 	switch(photometric) {
 		case PHOTOMETRIC_MINISBLACK:	// bitmap and greyscale image types
@@ -402,11 +408,15 @@ ReadPalette(TIFF *tiff, uint16_t photometric, uint16_t bitspersample, FIBITMAP *
 			break;
 
 		case PHOTOMETRIC_PALETTE:	// color map indexed
-			uint16_t *red;
-			uint16_t *green;
-			uint16_t *blue;
+			uint16_t *red = NULL;
+			uint16_t *green = NULL;
+			uint16_t *blue = NULL;
 			
-			TIFFGetField(tiff, TIFFTAG_COLORMAP, &red, &green, &blue); 
+			if(bitspersample == 0 || bitspersample > 8 ||
+			   (1U << bitspersample) > FreeImage_GetColorsUsed(dib) ||
+			   !TIFFGetField(tiff, TIFFTAG_COLORMAP, &red, &green, &blue) || !red || !green || !blue) {
+				throw "Invalid TIFF colormap";
+			}
 
 			// load the palette in the DIB
 
@@ -782,12 +792,12 @@ tiff_read_iptc_profile(TIFF *tiff, FIBITMAP *dib) {
 	BYTE *profile = NULL;
 	uint32_t profile_size = 0;
 
-    if(TIFFGetField(tiff,TIFFTAG_RICHTIFFIPTC, &profile_size, &profile) == 1) {
-		if (TIFFIsByteSwapped(tiff) != 0) {
-			TIFFSwabArrayOfLong((uint32_t *) profile, (unsigned long)profile_size);
-		}
-
-		return read_iptc_profile(dib, profile, 4 * profile_size);
+	// LibTIFF 4 defines RICHTIFFIPTC as TIFF_SETGET_C32_UINT8: the count is in bytes, and
+	// tif_dirread.c already byte-swaps data stored (wrongly) as TIFF_LONG. The old LibTIFF 3
+	// code here multiplied the count by 4 and swapped again, reading (and, for byte-swapped
+	// files, writing) up to 4x past the buffer (CVE-2024-28568, CVE-2024-9029).
+	if(TIFFGetField(tiff,TIFFTAG_RICHTIFFIPTC, &profile_size, &profile) == 1) {
+		return read_iptc_profile(dib, profile, profile_size);
 	}
 
 	return FALSE;
@@ -829,12 +839,27 @@ tiff_read_xmp_profile(TIFF *tiff, FIBITMAP *dib) {
 }
 
 /**
+	Go back to a directory after visiting another one (EXIF IFD, thumbnail IFD).
+	The directory is identified by its offset (TIFFCurrentDirOffset), not by its number:
+	since LibTIFF 4.5 directory numbers (tdir_t) are 32-bit, so the uint16_t copies this
+	plugin used to keep sent page 65536 back to page 0, and inside a SubIFD chain
+	TIFFCurrentDirectory() restarts at 0, so a number does not identify a SubIFD at all.
+	TIFFSetSubDirectory accepts the offset of any IFD, in the main chain or not.
+	@param tiff LibTIFF TIFF handle
+	@param diroff Offset of the directory to re-read
+*/
+static void
+RestoreDirectory(TIFF *tiff, toff_t diroff) {
+	TIFFSetSubDirectory(tiff, diroff);
+}
+
+/**
 	Read the Exif profile embedded in a TIFF
 	@param dib Input FIBITMAP
 	@param tiff LibTIFF TIFF handle
 	@return Returns TRUE if successful, FALSE otherwise
 */
-static BOOL 
+static BOOL
 tiff_read_exif_profile(FreeImageIO *io, fi_handle handle, TIFF *tiff, FIBITMAP *dib) {
 	BOOL bResult = FALSE;
 	toff_t exif_offset = 0;
@@ -846,7 +871,7 @@ tiff_read_exif_profile(FreeImageIO *io, fi_handle handle, TIFF *tiff, FIBITMAP *
 	if(TIFFGetField(tiff, TIFFTAG_EXIFIFD, &exif_offset)) {
 
 		const long tell_pos = io->tell_proc(handle);
-		const uint16_t cur_dir = TIFFCurrentDirectory(tiff);
+		const toff_t cur_diroff = TIFFCurrentDirOffset(tiff);
 
 		// read EXIF tags
 		if (TIFFReadEXIFDirectory(tiff, exif_offset)) {
@@ -855,7 +880,7 @@ tiff_read_exif_profile(FreeImageIO *io, fi_handle handle, TIFF *tiff, FIBITMAP *
 		}
 
 		io->seek_proc(handle, tell_pos, SEEK_SET);
-		TIFFSetDirectory(tiff, cur_dir);
+		RestoreDirectory(tiff, cur_diroff);
 	}
 
 	return bResult;
@@ -892,22 +917,10 @@ tiff_write_iptc_profile(TIFF *tiff, FIBITMAP *dib) {
 		uint32_t profile_size = 0;
 		// create a binary profile
 		if(write_iptc_profile(dib, &profile, &profile_size)) {
-			uint32_t iptc_size = profile_size;
-			iptc_size += (4-(iptc_size & 0x03)); // Round up for long word alignment
-			BYTE *iptc_profile = (BYTE*)malloc(iptc_size);
-			if(!iptc_profile) {
-				free(profile);
-				return FALSE;
-			}
-			memset(iptc_profile, 0, iptc_size);
-			memcpy(iptc_profile, profile, profile_size);
-			if (TIFFIsByteSwapped(tiff)) {
-				TIFFSwabArrayOfLong((uint32_t *) iptc_profile, (unsigned long)iptc_size/4);
-			}
-			// Tag is type TIFF_LONG so byte length is divided by four
-			TIFFSetField(tiff, TIFFTAG_RICHTIFFIPTC, iptc_size/4, iptc_profile);
+			// LibTIFF 4 writes RICHTIFFIPTC as TIFF_UNDEFINED with a byte count
+			// (the old count/4 truncated the profile to a quarter of its size)
+			TIFFSetField(tiff, TIFFTAG_RICHTIFFIPTC, profile_size, profile);
 			// release the profile data
-			free(iptc_profile);
 			free(profile);
 
 			return TRUE;
@@ -1326,8 +1339,8 @@ ReadThumbnail(FreeImageIO *io, fi_handle handle, void *data, TIFF *tiff, FIBITMA
 		if(!TIFFLastDirectory(tiff)) {
 			// save current position
 			const long tell_pos = io->tell_proc(handle);
-			const uint16_t cur_dir = TIFFCurrentDirectory(tiff);
-			
+			const toff_t cur_diroff = TIFFCurrentDirOffset(tiff);
+
 			// load the thumbnail
 			int page = 1;
 			int flags = TIFF_DEFAULT;
@@ -1335,10 +1348,10 @@ ReadThumbnail(FreeImageIO *io, fi_handle handle, void *data, TIFF *tiff, FIBITMA
 
 			// store the thumbnail (remember to release it before return)
 			FreeImage_SetThumbnail(dib, thumbnail);
-		
+
 			// restore current position
 			io->seek_proc(handle, tell_pos, SEEK_SET);
-			TIFFSetDirectory(tiff, cur_dir);
+			RestoreDirectory(tiff, cur_diroff);
 		}
 	}
 	
@@ -1355,10 +1368,10 @@ ReadThumbnail(FreeImageIO *io, fi_handle handle, void *data, TIFF *tiff, FIBITMA
 			if(subIFD_count > 0) {
 				// save current position
 				const long tell_pos = io->tell_proc(handle);
-				const uint16_t cur_dir = TIFFCurrentDirectory(tiff);
+				const toff_t cur_diroff = TIFFCurrentDirOffset(tiff);
 
 				// this code can cause unwanted recursion causing an overflow, because of the way TIFFSetSubDirectory work
-				
+
 				if(TIFFSetSubDirectory(tiff, subIFD_offsets[0])) {
 					// load the thumbnail
 					int page = -1; 
@@ -1371,7 +1384,7 @@ ReadThumbnail(FreeImageIO *io, fi_handle handle, void *data, TIFF *tiff, FIBITMA
 				
 				// restore current position
 				io->seek_proc(handle, tell_pos, SEEK_SET);
-				TIFFSetDirectory(tiff, cur_dir);
+				RestoreDirectory(tiff, cur_diroff);
 			}
 		}
 	}
@@ -1382,18 +1395,26 @@ ReadThumbnail(FreeImageIO *io, fi_handle handle, void *data, TIFF *tiff, FIBITMA
 		uint32_t ps_size = 0;
 		void *ps_data = NULL;
 		
-		if(TIFFGetField(tiff, TIFFTAG_PHOTOSHOP, &ps_size, &ps_data)) {
+		if(TIFFGetField(tiff, TIFFTAG_PHOTOSHOP, &ps_size, &ps_data) && ps_data && (ps_size > 0) && (ps_size <= 0x7FFFFFFF)) {
 			FIMEMORY *handle = FreeImage_OpenMemory((BYTE*)ps_data, ps_size);
-			
-			FreeImageIO io;
-			SetMemoryIO(&io);
-			
-			psdParser parser;
-			parser.ReadImageResources(&io, handle, ps_size);
+			if(handle) {
+				FreeImageIO io;
+				SetMemoryIO(&io);
 
-			FreeImage_SetThumbnail(dib, parser.GetThumbnail());
-			
-			FreeImage_CloseMemory(handle);
+				psdParser parser;
+				try {
+					parser.ReadImageResources(&io, handle, (LONG)ps_size);
+				} catch(const char *message) {
+					// A malformed Photoshop resource block must not cost the
+					// caller the main image: report it and keep whatever
+					// thumbnail was parsed before the error, if any.
+					FreeImage_OutputMessageProc(s_format_id, message);
+				}
+
+				FreeImage_SetThumbnail(dib, parser.GetThumbnail());
+
+				FreeImage_CloseMemory(handle);
+			}
 		}
 	}
 	
@@ -1430,7 +1451,8 @@ Load(FreeImageIO *io, fi_handle handle, int page, int flags, void *data) {
 		tif = fio->tif;
 
 		if (page != -1) {
-			if (!tif || !TIFFSetDirectory(tif, (uint16_t)page)) {
+			// tdir_t is 32-bit since LibTIFF 4.5: a uint16_t cast loaded page 65536 as page 0
+			if (!tif || (page < 0) || !TIFFSetDirectory(tif, (tdir_t)page)) {
 				throw "Error encountered while opening TIFF file";			
 			}
 		}
@@ -1812,7 +1834,7 @@ Load(FreeImageIO *io, fi_handle handle, int page, int flags, void *data) {
 							// CMYKA+
 							if(alpha) {
 								for (int l = 0; l < strips; l++) {					
-									for(BYTE *pixel = bits, *al_pixel = alpha_bits, *src_pixel =  buf + l * src_line; pixel < bits + dib_pitch; pixel += dibBpp, al_pixel += alpha_Bpp, src_pixel += srcBpp) {
+									for(BYTE *pixel = bits, *al_pixel = alpha_bits, *src_pixel =  buf + l * src_line; pixel < bits + dst_line; pixel += dibBpp, al_pixel += alpha_Bpp, src_pixel += srcBpp) {
 										// copy pixel byte by byte
 										BYTE b = 0;
 										for( ; b < dibBpp; ++b) {
@@ -1854,6 +1876,13 @@ Load(FreeImageIO *io, fi_handle handle, int page, int flags, void *data) {
 				
 				}
 				else if(planar_config == PLANARCONFIG_SEPARATE) {
+
+					// same guard as the generic separate-plane loader (CVE-2024-28566)
+					if (Bpc == 0 || (unsigned)chCount * Bpc > dibBpp || (alpha && Bpc > alpha_Bpp)) {
+						free(buf);
+						FreeImage_Unload(alpha);
+						throw FI_MSG_ERROR_UNSUPPORTED_FORMAT;
+					}
 
 					BYTE *dib_strip = bits;
 					BYTE *al_strip = alpha_bits;
@@ -1904,9 +1933,10 @@ Load(FreeImageIO *io, fi_handle handle, int page, int flags, void *data) {
 							for (int l = 0; l < strips; l++, src_line_begin += src_line, dst_line_begin -= dst_pitch ) {
 								// - loop for pixels in strip -
 								
-								const BYTE* const src_line_end = src_line_begin + src_line;
+								// at most 'width' samples per line, so the destination cannot be overrun
+								const BYTE* const src_line_end = src_line_begin + MIN<tmsize_t>(src_line, (tmsize_t)width * Bpc);
 								for (BYTE *src_bits = src_line_begin, * dst_bits = dst_line_begin; src_bits < src_line_end; src_bits += Bpc, dst_bits += Bpp) {
-									AssignPixel(dst_bits + channelOffset, src_bits, Bpc);									
+									AssignPixel(dst_bits + channelOffset, src_bits, Bpc);
 								} // line
 								
 							} // strips
@@ -2016,8 +2046,19 @@ Load(FreeImageIO *io, fi_handle handle, int page, int flags, void *data) {
 							}
 						}
 						else {
+							// Copy 'width' pixels, not 'dst_pitch' bytes: the pitch includes padding, so the
+							// old bound read up to (pitch - line) / Bpp extra source pixels past the strip
+							// buffer on the last line (CVE-2024-28566). Each source pixel must also hold
+							// the Bpp bytes copied from it.
+							if (Bpp == 0 || srcBpp < Bpp) {
+								free(buf);
+								throw FI_MSG_ERROR_UNSUPPORTED_FORMAT;
+							}
+							const tmsize_t npixels = MIN<tmsize_t>((tmsize_t)width, src_line / srcBpp);
 							for (int l = 0; l < strips; l++) {
-								for(BYTE *pixel = bits, *src_pixel =  buf + l * src_line; pixel < bits + dst_pitch; pixel += Bpp, src_pixel += srcBpp) {
+								BYTE *pixel = bits;
+								const BYTE *src_pixel = buf + l * src_line;
+								for (tmsize_t x = 0; x < npixels; x++, pixel += Bpp, src_pixel += srcBpp) {
 									AssignPixel(pixel, src_pixel, Bpp);
 								}
 								bits -= dst_pitch;
@@ -2028,6 +2069,17 @@ Load(FreeImageIO *io, fi_handle handle, int page, int flags, void *data) {
 				else if(planar_config == PLANARCONFIG_SEPARATE) {
 					
 					const unsigned Bpc = bitspersample / 8;
+
+					// Each plane holds one sample per pixel. Sub-byte samples (Bpc == 0) made the pixel
+					// loop below never advance through the source, and a destination pixel narrower than
+					// chCount samples put channelOffset past the pixel: both wrote past the bitmap
+					// (CVE-2024-28566). Copy at most 'width' samples per line.
+					if (Bpc == 0 || (bitspersample % 8) != 0 || (unsigned)chCount * Bpc > Bpp) {
+						free(buf);
+						throw FI_MSG_ERROR_UNSUPPORTED_FORMAT;
+					}
+					const tmsize_t plane_line = MIN<tmsize_t>(src_line, (tmsize_t)width * Bpc);
+
 					BYTE* dib_strip = bits;
 					// - loop for strip blocks -
 					
@@ -2058,7 +2110,7 @@ Load(FreeImageIO *io, fi_handle handle, int page, int flags, void *data) {
 									
 								// - loop for pixels in strip -
 								
-								const BYTE* const src_line_end = src_line_begin + src_line;
+								const BYTE* const src_line_end = src_line_begin + plane_line;
 
 								for (BYTE* src_bits = src_line_begin, * dst_bits = dst_line_begin; src_bits < src_line_end; src_bits += Bpc, dst_bits += Bpp) {
 									// actually assigns channel
@@ -2320,7 +2372,15 @@ Load(FreeImageIO *io, fi_handle handle, int page, int flags, void *data) {
 		ReadMetadata(io, handle, tif, dib);
 
 		// copy ICC profile data (must be done after FreeImage_Allocate)
-		
+		// ReadMetadata may switch to the EXIF IFD and back (TIFFReadEXIFDirectory + TIFFSetDirectory),
+		// which frees and re-reads the directory: the iccBuf fetched above is then dangling
+		// (CVE-2024-28567). Fetch it again from the current directory, unless the CMYK->RGB
+		// conversion above invalidated it.
+		if (iccBuf != NULL) {
+			iccSize = 0;
+			iccBuf = NULL;
+			TIFFGetField(tif, TIFFTAG_ICCPROFILE, &iccSize, &iccBuf);
+		}
 		FreeImage_CreateICCProfile(dib, iccBuf, iccSize);
 		if (photometric == PHOTOMETRIC_SEPARATED) {
 			if (asCMYK) {

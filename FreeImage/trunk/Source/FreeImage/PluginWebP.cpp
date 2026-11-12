@@ -414,8 +414,20 @@ Load(FreeImageIO *io, fi_handle handle, int page, int flags, void *data) {
 
 		return dib;
 
+	} catch(const char *text) {
+		WebPDataClear(&webp_frame.bitstream);
+		if(dib) {
+			FreeImage_Unload(dib);
+		}
+		if(NULL != text) {
+			FreeImage_OutputMessageProc(s_format_id, text);
+		}
+		return NULL;
 	} catch(int) {
 		WebPDataClear(&webp_frame.bitstream);
+		if(dib) {
+			FreeImage_Unload(dib);
+		}
 		return NULL;
 	}
 }

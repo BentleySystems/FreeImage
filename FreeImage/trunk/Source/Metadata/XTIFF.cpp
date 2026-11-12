@@ -113,8 +113,10 @@ tiff_read_geotiff_profile(TIFF *tif, FIBITMAP *dib) {
 	char defaultKey[16];
 
 	// first check for a mandatory tag
+	// (the GeoTIFF arrays are TIFF_VARIABLE custom fields: LibTIFF passes their count
+	// as a uint16_t; a signed short turned counts above 32767 into negative values)
 	{
-		short tag_count = 0;
+		uint16_t tag_count = 0;
 		void* data = NULL;
 		
 		if(!TIFFGetField(tif, TIFFTAG_GEOKEYDIRECTORY, &tag_count, &data)) {
@@ -158,7 +160,7 @@ tiff_read_geotiff_profile(TIFF *tif, FIBITMAP *dib) {
 				FreeImage_DeleteTag(tag);
 			}
 		} else {
-			short tag_count = 0;
+			uint16_t tag_count = 0;
 			void* data = NULL;
 
 			if(TIFFGetField(tif, fieldInfo->field_tag, &tag_count, &data)) {
@@ -223,6 +225,17 @@ tiff_write_geotiff_profile(TIFF *tif, FIBITMAP *dib) {
 // ----------------------------------------------------------
 //   TIFF EXIF tag reading & writing
 // ----------------------------------------------------------
+
+/**
+LibTIFF 4 does not store RATIONAL / SRATIONAL values as numerator/denominator pairs:
+it converts them to float or double, and which one depends on the field's set/get
+type, not on the TIFF type ("Rational2Double", see tif_dirinfo.c). TIFFFieldSetGetSize
+gives the storage size (4 or 8) that TIFFGetField / TIFFSetField use for the field.
+*/
+static double
+tiff_real_value(const void *data, int storage_size, uint32_t index) {
+	return (storage_size == 8) ? ((const double*)data)[index] : (double)((const float*)data)[index];
+}
 
 /**
 Read a single Exif tag
@@ -328,14 +341,19 @@ tiff_read_exif_tag(TIFF *tif, uint32_t tag_id, FIBITMAP *dib, TagLib::MDMODEL md
 
 			// access fields as values
 
-			// Note: 
-			// For TIFF_RATIONAL values, TIFFDataWidth() returns 8, but LibTIFF use internaly 4-byte float to represent rationals.
+			// Note:
+			// For TIFF_RATIONAL values, TIFFDataWidth() returns 8, but LibTIFF stores rationals
+			// as a 4-byte float or an 8-byte double, depending on the field (see tiff_real_value).
 			{
 				TIFFDataType tag_type = TIFFFieldDataType(fip);
 				switch(tag_type) {
 					case TIFF_RATIONAL:
 					case TIFF_SRATIONAL:
-						value_size = 4;
+						value_size = TIFFFieldSetGetSize(fip);
+						if((value_size != 4) && (value_size != 8)) {
+							// unknown storage, ignore the tag
+							return TRUE;
+						}
 						break;
 					default:
 						value_size = TIFFDataWidth(tag_type);
@@ -374,6 +392,15 @@ tiff_read_exif_tag(TIFF *tif, uint32_t tag_id, FIBITMAP *dib, TagLib::MDMODEL md
 	}
 
 	// build FreeImage tag from Tiff Tag data we collected
+
+	const int real_size = TIFFFieldSetGetSize(fip);
+	if(((TIFFFieldDataType(fip) == TIFF_RATIONAL) || (TIFFFieldDataType(fip) == TIFF_SRATIONAL)) && (real_size != 4) && (real_size != 8)) {
+		// unknown storage for a rational, ignore the tag
+		if(mem_alloc) {
+			_TIFFfree(raw_data);
+		}
+		return TRUE;
+	}
 
 	FITAG *fitag = FreeImage_CreateTag();
 	if(!fitag) {
@@ -444,11 +471,17 @@ tiff_read_exif_tag(TIFF *tif, uint32_t tag_id, FIBITMAP *dib, TagLib::MDMODEL md
 			break;
 
 		case TIFF_RATIONAL: {
-			// LibTIFF converts rational to floats : reconvert floats to rationals
+			// LibTIFF converts rational to floats or doubles : reconvert them to rationals
 			DWORD *rvalue = (DWORD*)malloc(2 * value_count * sizeof(DWORD));
+			if(!rvalue) {
+				FreeImage_DeleteTag(fitag);
+				if(mem_alloc) {
+					_TIFFfree(raw_data);
+				}
+				return FALSE;
+			}
 			for(uint32_t i = 0; i < value_count; i++) {
-				float *fv = (float*)raw_data;
-				FIRational rational(fv[i]);
+				FIRational rational(tiff_real_value(raw_data, real_size, i));
 				rvalue[2*i] = rational.getNumerator();
 				rvalue[2*i+1] = rational.getDenominator();
 			}
@@ -461,15 +494,22 @@ tiff_read_exif_tag(TIFF *tif, uint32_t tag_id, FIBITMAP *dib, TagLib::MDMODEL md
 		break;
 
 		case TIFF_SRATIONAL: {
-			// LibTIFF converts rational to floats : reconvert floats to rationals
+			// LibTIFF converts rational to floats or doubles : reconvert them to rationals
 			LONG *rvalue = (LONG*)malloc(2 * value_count * sizeof(LONG));
+			if(!rvalue) {
+				FreeImage_DeleteTag(fitag);
+				if(mem_alloc) {
+					_TIFFfree(raw_data);
+				}
+				return FALSE;
+			}
 			for(uint32_t i = 0; i < value_count; i++) {
-				float *fv = (float*)raw_data;
-				FIRational rational(fv[i]);
+				FIRational rational(tiff_real_value(raw_data, real_size, i));
 				rvalue[2*i] = rational.getNumerator();
 				rvalue[2*i+1] = rational.getDenominator();
 			}
-			FreeImage_SetTagType(fitag, FIDT_RATIONAL);
+			// signed: was stored as FIDT_RATIONAL, so negative values read back as ~4 billion
+			FreeImage_SetTagType(fitag, FIDT_SRATIONAL);
 			FreeImage_SetTagLength(fitag, TIFFDataWidth( TIFFFieldDataType(fip) ) * value_count);
 			FreeImage_SetTagCount(fitag, value_count);
 			FreeImage_SetTagValue(fitag, rvalue);
@@ -515,11 +555,17 @@ tiff_read_exif_tag(TIFF *tif, uint32_t tag_id, FIBITMAP *dib, TagLib::MDMODEL md
 		case TIFF_ASCII:
 		default: {
 			size_t length = 0;
-			if(!mem_alloc && (TIFFFieldDataType(fip) == TIFF_ASCII) && (TIFFFieldReadCount(fip) == TIFF_VARIABLE)) {
-				// when metadata tag is of type ASCII and it's value is of variable size (TIFF_VARIABLE),
-				// tiff_read_exif_tag function gives length of 1 so all strings are truncated ...
-				// ... try to avoid this by using an explicit calculation for 'length'
-				length = strlen((char*)raw_data) + 1;
+			if(!mem_alloc && (TIFFFieldDataType(fip) == TIFF_ASCII) && raw_data) {
+				if(TIFFFieldPassCount(fip)) {
+					// LibTIFF gave the byte count with the data
+					length = value_count;
+				} else {
+					// LibTIFF only gives the string, NUL-terminated. Measure it for every
+					// read count: ASCII fields with a fixed count (DateTime, DateTimeOriginal: 20,
+					// ImageUniqueID: 33, ...) used to fall through with a length of 0 and came
+					// back as empty strings.
+					length = strlen((char*)raw_data) + 1;
+				}
 			}
 			else if(mem_alloc) {
 				// raw_data allocated by us as _TIFFmalloc(value_size * value_count);
@@ -701,6 +747,168 @@ skip_write_field(TIFF* tif, uint32_t tag) {
 }
 
 /**
+Set one tag with the argument list LibTIFF 4 expects for its field (_TIFFVSetField
+in tif_dir.c), which depends on the field definition, not on the tag data:
+- fields with passcount take a count (uint16 for TIFF_VARIABLE, uint32 for
+  TIFF_VARIABLE2) and a pointer;
+- TIFF_SETGET_UINT16_PAIR fields (PageNumber, DotRange, ...) take two values;
+- other fields with several values (fixed count > 1, TIFF_VARIABLE, TIFF_SPP)
+  take a pointer only;
+- single-value fields take the value itself.
+The old code passed (count, pointer) to every field, so LibTIFF took the count as
+the value of single-value tags (YCbCrPositioning = 2 was written as 1) and as the
+data pointer of fixed arrays (WhitePoint, PrimaryChromaticities: a wild read).
+Rationals are numerator/denominator pairs in FreeImage, while LibTIFF takes them
+as float or double (tiff_real_value) and converts them itself.
+
+@return Returns TRUE if the tag was set
+*/
+static BOOL
+tiff_write_exif_tag(TIFF *tif, const TIFFField *fld, FITAG *tag) {
+	const uint32_t tag_id = TIFFFieldTag(fld);
+	const TIFFDataType type = TIFFFieldDataType(fld);
+	const void *value = FreeImage_GetTagValue(tag);
+	const DWORD count = FreeImage_GetTagCount(tag);
+
+	if(!value || !count) {
+		return FALSE;
+	}
+	if((fld->set_get_field_type == TIFF_SETGET_UNDEFINED) || (fld->set_get_field_type == TIFF_SETGET_OTHER)) {
+		// special fields (TransferFunction, ColorMap, SubIFD, ...) have their own argument lists
+		return FALSE;
+	}
+
+	if(type == TIFF_ASCII) {
+		if(TIFFFieldPassCount(fld)) {
+			return TIFFSetField(tif, tag_id, (uint32_t)FreeImage_GetTagLength(tag), value);
+		}
+		// FreeImage ASCII values are NUL-terminated
+		return TIFFSetField(tif, tag_id, value);
+	}
+
+	// number of values LibTIFF reads from the data: it must match the tag, or LibTIFF
+	// reads past the end of the tag value (or silently drops values)
+	const int writecount = TIFFFieldWriteCount(fld);
+	DWORD expected = count;
+	if(TIFFFieldPassCount(fld)) {
+		if((writecount != TIFF_VARIABLE2) && (count > 0xFFFF)) {
+			// the count is passed as a uint16
+			return FALSE;
+		}
+	} else if((writecount == TIFF_VARIABLE) || (writecount == TIFF_VARIABLE2)) {
+		expected = 1;
+	} else if(writecount == TIFF_SPP) {
+		uint16_t spp = 1;
+		TIFFGetFieldDefaulted(tif, TIFFTAG_SAMPLESPERPIXEL, &spp);
+		expected = spp;
+	} else {
+		expected = (DWORD)writecount;
+	}
+	if(count != expected) {
+		return FALSE;
+	}
+
+	// element size LibTIFF uses for this field
+	const BOOL is_rational = (type == TIFF_RATIONAL) || (type == TIFF_SRATIONAL);
+	const int element_size = (fld->set_get_field_type == TIFF_SETGET_UINT16_PAIR) ? 2 : TIFFFieldSetGetSize(fld);
+	if(is_rational) {
+		if((element_size != 4) && (element_size != 8)) {
+			return FALSE;
+		}
+	} else if(element_size != (int)TIFFDataWidth(type)) {
+		return FALSE;
+	}
+
+	// convert rationals to the float / double storage of the field
+	const void *data = value;
+	void *converted = NULL;
+	if(is_rational) {
+		converted = malloc((size_t)count * element_size);
+		if(!converted) {
+			return FALSE;
+		}
+		for(DWORD i = 0; i < count; i++) {
+			double real = 0;
+			if(type == TIFF_RATIONAL) {
+				const DWORD *r = (const DWORD*)value;
+				real = r[2*i+1] ? (double)r[2*i] / (double)r[2*i+1] : 0;
+			} else {
+				const LONG *r = (const LONG*)value;
+				real = r[2*i+1] ? (double)r[2*i] / (double)r[2*i+1] : 0;
+			}
+			if(element_size == 8) {
+				((double*)converted)[i] = real;
+			} else {
+				((float*)converted)[i] = (float)real;
+			}
+		}
+		data = converted;
+	}
+
+	int ok = 0;
+	if(TIFFFieldPassCount(fld)) {
+		if(writecount == TIFF_VARIABLE2) {
+			ok = TIFFSetField(tif, tag_id, (uint32_t)count, data);
+		} else {
+			ok = TIFFSetField(tif, tag_id, (int)count, data);
+		}
+	} else if(fld->set_get_field_type == TIFF_SETGET_UINT16_PAIR) {
+		const uint16_t *pair = (const uint16_t*)data;
+		ok = TIFFSetField(tif, tag_id, (int)pair[0], (int)pair[1]);
+	} else if((expected > 1) || (writecount == TIFF_VARIABLE) || (writecount == TIFF_VARIABLE2) || (writecount == TIFF_SPP)) {
+		ok = TIFFSetField(tif, tag_id, data);
+	} else {
+		// single value, passed by value (variadic promotion: int, uint32, uint64 or double)
+		switch(type) {
+			case TIFF_BYTE:
+			case TIFF_UNDEFINED:
+				ok = TIFFSetField(tif, tag_id, (int)*(const uint8_t*)data);
+				break;
+			case TIFF_SBYTE:
+				ok = TIFFSetField(tif, tag_id, (int)*(const int8_t*)data);
+				break;
+			case TIFF_SHORT:
+				ok = TIFFSetField(tif, tag_id, (int)*(const uint16_t*)data);
+				break;
+			case TIFF_SSHORT:
+				ok = TIFFSetField(tif, tag_id, (int)*(const int16_t*)data);
+				break;
+			case TIFF_LONG:
+			case TIFF_IFD:
+				ok = TIFFSetField(tif, tag_id, *(const uint32_t*)data);
+				break;
+			case TIFF_SLONG:
+				ok = TIFFSetField(tif, tag_id, *(const int32_t*)data);
+				break;
+			case TIFF_LONG8:
+			case TIFF_IFD8:
+				ok = TIFFSetField(tif, tag_id, *(const uint64_t*)data);
+				break;
+			case TIFF_SLONG8:
+				ok = TIFFSetField(tif, tag_id, *(const int64_t*)data);
+				break;
+			case TIFF_RATIONAL:
+			case TIFF_SRATIONAL:
+				ok = TIFFSetField(tif, tag_id, tiff_real_value(data, element_size, 0));
+				break;
+			case TIFF_FLOAT:
+				ok = TIFFSetField(tif, tag_id, (double)*(const float*)data);
+				break;
+			case TIFF_DOUBLE:
+				ok = TIFFSetField(tif, tag_id, *(const double*)data);
+				break;
+			default:
+				break;
+		}
+	}
+
+	if(converted) {
+		free(converted);
+	}
+	return ok ? TRUE : FALSE;
+}
+
+/**
 Write all known exif tags
 
 @param tif TIFF handle
@@ -754,11 +962,7 @@ tiff_write_exif_tags(TIFF *tif, TagLib::MDMODEL md_model, FIBITMAP *dib) {
 				continue;
 			}
 
-			if(tag_type == FIDT_ASCII) {
-				TIFFSetField(tif, tag_id, FreeImage_GetTagValue(tag));
-			} else {
-				TIFFSetField(tif, tag_id, FreeImage_GetTagCount(tag), FreeImage_GetTagValue(tag));
-			}
+			tiff_write_exif_tag(tif, fld, tag);
 		}
 	}
 

@@ -1,0 +1,51 @@
+# SPDX-License-Identifier: BSD-3-Clause
+# Copyright (c) Contributors to the OpenEXR Project.
+
+@PACKAGE_INIT@
+
+include(CMakeFindDependencyMacro)
+
+set(openexr_needthreads @OPENEXR_ENABLE_THREADING@)
+if (openexr_needthreads)
+  set(THREADS_PREFER_PTHREAD_FLAG ON)
+  find_dependency(Threads)
+endif()
+unset(openexr_needthreads)
+
+find_dependency(Imath)
+
+# A static OpenEXRCore links to any dependency found via pkg-config through
+# a PkgConfig:: imported target, which must be recreated here.
+macro(openexr_find_pkgconfig_dependency prefix module)
+  if (NOT TARGET PkgConfig::${prefix})
+    find_dependency(PkgConfig)
+    pkg_check_modules(${prefix} REQUIRED QUIET IMPORTED_TARGET GLOBAL ${module})
+  endif()
+endmacro()
+
+if ("@EXR_DEFLATE_LIB@" STREQUAL "PkgConfig::deflate")
+  if (NOT @BUILD_SHARED_LIBS@)
+    openexr_find_pkgconfig_dependency(deflate libdeflate)
+  endif()
+elseif (@libdeflate_FOUND@)
+  find_dependency(libdeflate)
+endif()
+
+if ("@EXR_OPENJPH_LIB@" STREQUAL "PkgConfig::openjph")
+  if (NOT @BUILD_SHARED_LIBS@)
+    openexr_find_pkgconfig_dependency(openjph "openjph=@openjph_VERSION@")
+  endif()
+elseif (NOT @OPENEXR_USE_INTERNAL_OPENJPH@)
+  find_dependency(openjph)
+endif()
+
+if ("@EXR_ZSTD_LIB@" STREQUAL "PkgConfig::libzstd")
+  if (NOT @BUILD_SHARED_LIBS@)
+    openexr_find_pkgconfig_dependency(libzstd libzstd)
+  endif()
+elseif (@zstd_FOUND@)
+  find_dependency(zstd CONFIG)
+endif()
+
+include("${CMAKE_CURRENT_LIST_DIR}/@PROJECT_NAME@Targets.cmake")
+check_required_components("@PROJECT_NAME@")

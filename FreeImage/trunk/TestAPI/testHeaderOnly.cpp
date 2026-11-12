@@ -151,7 +151,8 @@ Test loading and saving of Exif raw data
 */
 static BOOL 
 testExifRawFile(const char *lpszPathName, int load_flags, int save_flags) {
-	const char *lpszDstPathName = "raw_exif.jpg";
+	const std::string outputPath = testOutputPath("raw_exif.jpg");
+	const char *lpszDstPathName = outputPath.c_str();
 
 	FIBITMAP *dib = NULL, *dst = NULL;
 

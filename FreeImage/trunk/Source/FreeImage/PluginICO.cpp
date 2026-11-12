@@ -292,17 +292,33 @@ LoadStandardIcon(FreeImageIO *io, fi_handle handle, int flags, BOOL header_only)
 
 	// load the BITMAPINFOHEADER
 	BITMAPINFOHEADER bmih;
-	io->read_proc(&bmih, sizeof(BITMAPINFOHEADER), 1, handle);
+	if(io->read_proc(&bmih, sizeof(BITMAPINFOHEADER), 1, handle) != 1) {
+		return NULL;
+	}
 #ifdef FREEIMAGE_BIGENDIAN
 	SwapInfoHeader(&bmih);
 #endif
+	if(bmih.biSize != sizeof(BITMAPINFOHEADER) || bmih.biPlanes != 1 ||
+	   bmih.biWidth <= 0 || bmih.biWidth > 256 || bmih.biHeight <= 0 || bmih.biHeight > 512 ||
+	   (bmih.biHeight % 2) != 0) {
+		return NULL;
+	}
+	switch(bmih.biBitCount) {
+		case 1:
+		case 4:
+		case 8:
+		case 16:
+		case 24:
+		case 32:
+			break;
+		default:
+			return NULL;
+	}
 
 	// allocate the bitmap
 	int width  = bmih.biWidth;
 	int height = bmih.biHeight / 2; // height == xor + and mask
 	unsigned bit_count = bmih.biBitCount;
-	unsigned line   = CalculateLine(width, bit_count);
-	unsigned pitch  = CalculatePitch(line);
 
 	// allocate memory for one icon
 
@@ -311,10 +327,14 @@ LoadStandardIcon(FreeImageIO *io, fi_handle handle, int flags, BOOL header_only)
 	if (dib == NULL) {
 		return NULL;
 	}
+	const unsigned pitch = FreeImage_GetPitch(dib);
 
 	if( bmih.biBitCount <= 8 ) {
 		// read the palette data
-		io->read_proc(FreeImage_GetPalette(dib), CalculateUsedPaletteEntries(bit_count) * sizeof(RGBQUAD), 1, handle);
+		if(io->read_proc(FreeImage_GetPalette(dib), CalculateUsedPaletteEntries(bit_count) * sizeof(RGBQUAD), 1, handle) != 1) {
+			FreeImage_Unload(dib);
+			return NULL;
+		}
 #if FREEIMAGE_COLORORDER == FREEIMAGE_COLORORDER_RGB
 		RGBQUAD *pal = FreeImage_GetPalette(dib);
 		for(unsigned i = 0; i < CalculateUsedPaletteEntries(bit_count); i++) {
@@ -329,7 +349,10 @@ LoadStandardIcon(FreeImageIO *io, fi_handle handle, int flags, BOOL header_only)
 	}
 
 	// read the icon
-	io->read_proc(FreeImage_GetBits(dib), height * pitch, 1, handle);
+	if(io->read_proc(FreeImage_GetBits(dib), height * pitch, 1, handle) != 1) {
+		FreeImage_Unload(dib);
+		return NULL;
+	}
 
 #ifdef FREEIMAGE_BIGENDIAN
 	if (bit_count == 16) {

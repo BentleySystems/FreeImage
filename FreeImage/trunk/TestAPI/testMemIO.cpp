@@ -54,7 +54,7 @@ void testSaveMemIO(const char *lpszPathName) {
 	FIBITMAP *check = FreeImage_LoadFromMemory(mem_fif, hmem, 0);
 
 	// save as a regular file
-	FreeImage_Save(FIF_PNG, check, "dump.png", PNG_DEFAULT);
+	FreeImage_Save(FIF_PNG, check, testOutputPath("dump.png").c_str(), PNG_DEFAULT);
 
 	// make sure to free the data since FreeImage_SaveToMemory 
 	// will cause it to be malloc'd
@@ -93,7 +93,7 @@ void testLoadMemIO(const char *lpszPathName) {
 				FIBITMAP *check = FreeImage_LoadFromMemory(fif, hmem, PNG_DEFAULT);
 
 				// save as a regular file
-				FreeImage_Save(FIF_PNG, check, "blob.png", PNG_DEFAULT);
+				FreeImage_Save(FIF_PNG, check, testOutputPath("blob.png").c_str(), PNG_DEFAULT);
 				FreeImage_Unload(check);
 				
 				// close the stream
@@ -128,7 +128,7 @@ void testAcquireMemIO(const char *lpszPathName) {
 	FreeImage_AcquireMemory(hmem, &mem_buffer, &size_in_bytes);
 
 	// save the buffer in a file stream
-	FILE *stream = fopen("buffer.png", "wb");
+	FILE *stream = fopen(testOutputPath("buffer.png").c_str(), "wb");
 	if(stream) {
 		fwrite(mem_buffer, sizeof(BYTE), size_in_bytes, stream);
 		fclose(stream);

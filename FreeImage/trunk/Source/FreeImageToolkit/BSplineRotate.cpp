@@ -193,7 +193,7 @@ static void
 GetRow(double *Image, long y, double *Line, long Width) {
 	long	x;
 
-	Image = Image + (y * Width);
+	Image = Image + ((ptrdiff_t)y * Width);
 	for(x = 0L; x < Width; x++) {
 		Line[x] = (double)*Image++;
 	}
@@ -245,7 +245,7 @@ static void
 PutRow(double *Image, long y, double *Line, long Width) {
 	long	x;
 
-	Image = Image + (y * Width);
+	Image = Image + ((ptrdiff_t)y * Width);
 	for(x = 0L; x < Width; x++) {
 		*Image++ = (double)Line[x];
 	}
@@ -333,6 +333,24 @@ SamplesToCoefficients(double *Image, long Width, long Height, long spline_degree
 /////////////////////////////////////////////////////////////////////////////////////////////////////////////
 // Interpolation routines
 
+// Coordinates up to this magnitude are used as they are; larger ones are
+// folded back by whole mirror periods (see InterpolatedValue).
+#define MAX_SPLINE_COORDINATE	1073741824.0	// 2^30
+
+/**
+Moves a coordinate whose magnitude exceeds MAX_SPLINE_COORDINATE back by a
+whole number of mirror periods (2 * (Length - 1), or 1 for a 1-sample axis).
+Coordinates in range, and non-finite ones, are returned unchanged.
+*/
+static double
+FoldMirrorCoordinate(double v, long Length) {
+	if(!(fabs(v) > MAX_SPLINE_COORDINATE) || !(fabs(v) <= DBL_MAX)) {
+		return v;
+	}
+	const double period = (Length > 1L) ? 2.0 * ((double)Length - 1.0) : 1.0;
+	return fmod(v, period);
+}
+
 /**
 Perform the bidimensional interpolation of an image.
 Given an array of spline coefficients, return the value of 
@@ -354,22 +372,36 @@ InterpolatedValue(double *Bcoeff, long Width, long Height, double x, double y, l
 	double	xWeight[6], yWeight[6];
 	double	interpolated;
 	double	w, w2, w4, t, t0, t1;
-	long	xIndex[6], yIndex[6];
-	long	Width2 = 2L * Width - 2L, Height2 = 2L * Height - 2L;
-	long	i, j, k;
+	long long	xIndex[6], yIndex[6];
+	const long long	Width2 = 2LL * Width - 2LL, Height2 = 2LL * Height - 2LL;
+	long long	i, j;
+	long	k;
+
+	// The mirror boundaries repeat every 2 * (Length - 1) samples (a 1-sample
+	// axis is constant), so a coordinate too large for the index arithmetic
+	// below is moved back by whole periods. fmod is exact and keeps the
+	// fractional part, so the interpolated value is the same; coordinates in
+	// range are not touched. Before this, (long)floor() of a large coordinate
+	// overflowed and the mirror step could produce an index outside the image.
+	x = FoldMirrorCoordinate(x, Width);
+	y = FoldMirrorCoordinate(y, Height);
+	if(!(fabs(x) <= MAX_SPLINE_COORDINATE) || !(fabs(y) <= MAX_SPLINE_COORDINATE)) {
+		// not finite
+		return 0;
+	}
 
 	// compute the interpolation indexes
 	if (spline_degree & 1L) {
-		i = (long)floor(x) - spline_degree / 2L;
-		j = (long)floor(y) - spline_degree / 2L;
+		i = (long long)floor(x) - spline_degree / 2L;
+		j = (long long)floor(y) - spline_degree / 2L;
 		for(k = 0; k <= spline_degree; k++) {
 			xIndex[k] = i++;
 			yIndex[k] = j++;
 		}
 	}
 	else {
-		i = (long)floor(x + 0.5) - spline_degree / 2L;
-		j = (long)floor(y + 0.5) - spline_degree / 2L;
+		i = (long long)floor(x + 0.5) - spline_degree / 2L;
+		j = (long long)floor(y + 0.5) - spline_degree / 2L;
 		for (k = 0; k <= spline_degree; k++) {
 			xIndex[k] = i++;
 			yIndex[k] = j++;
@@ -475,13 +507,13 @@ InterpolatedValue(double *Bcoeff, long Width, long Height, double x, double y, l
 
 	// apply the mirror boundary conditions
 	for(k = 0; k <= spline_degree; k++) {
-		xIndex[k] = (Width == 1L) ? (0L) : ((xIndex[k] < 0L) ?
+		xIndex[k] = (Width == 1L) ? (0LL) : ((xIndex[k] < 0LL) ?
 			(-xIndex[k] - Width2 * ((-xIndex[k]) / Width2))
 			: (xIndex[k] - Width2 * (xIndex[k] / Width2)));
 		if (Width <= xIndex[k]) {
 			xIndex[k] = Width2 - xIndex[k];
 		}
-		yIndex[k] = (Height == 1L) ? (0L) : ((yIndex[k] < 0L) ?
+		yIndex[k] = (Height == 1L) ? (0LL) : ((yIndex[k] < 0LL) ?
 			(-yIndex[k] - Height2 * ((-yIndex[k]) / Height2))
 			: (yIndex[k] - Height2 * (yIndex[k] / Height2)));
 		if (Height <= yIndex[k]) {
@@ -492,7 +524,7 @@ InterpolatedValue(double *Bcoeff, long Width, long Height, double x, double y, l
 	// perform interpolation
 	interpolated = 0.0;
 	for(j = 0; j <= spline_degree; j++) {
-		p = Bcoeff + (yIndex[j] * Width);
+		p = Bcoeff + (ptrdiff_t)(yIndex[j] * Width);
 		w = 0.0;
 		for(i = 0; i <= spline_degree; i++) {
 			w += xWeight[i] * p[xIndex[i]];
@@ -565,14 +597,20 @@ Rotate8Bit(FIBITMAP *dib, double angle, double x_shift, double y_shift, double x
 	}
 
 	// allocate a temporary array
-	ImageRasterArray = (double*)malloc(width * height * sizeof(double));
+	// width * height in size_t: as an int product it wrapped for more than
+	// 2^31 pixels and allocated too small a buffer for the copy below
+	if((size_t)width > ((size_t)-1) / sizeof(double) / (size_t)height) {
+		FreeImage_Unload(dst);
+		return NULL;
+	}
+	ImageRasterArray = (double*)malloc((size_t)width * (size_t)height * sizeof(double));
 	if(!ImageRasterArray) {
 		FreeImage_Unload(dst);
 		return NULL;
 	}
 	// copy data samples
 	for(y = 0; y < height; y++) {
-		double *pImage = &ImageRasterArray[y*width];
+		double *pImage = &ImageRasterArray[(size_t)y * (size_t)width];
 		BYTE *src_bits = FreeImage_GetScanLine(dib, height-1-y);
 
 		for(x = 0; x < width; x++) {
@@ -653,6 +691,13 @@ FreeImage_RotateEx(FIBITMAP *dib, double angle, double x_shift, double y_shift, 
 	FIBITMAP *src8 = NULL, *dst8 = NULL, *dst = NULL;
 
 	if(!FreeImage_HasPixels(dib)) return NULL;
+
+	// the geometry must be finite (NaN or infinity would reach the spline
+	// index arithmetic as integers converted from NaN)
+	if(!(fabs(angle) <= DBL_MAX) || !(fabs(x_shift) <= DBL_MAX) || !(fabs(y_shift) <= DBL_MAX)
+		|| !(fabs(x_origin) <= DBL_MAX) || !(fabs(y_origin) <= DBL_MAX)) {
+		return NULL;
+	}
 
 	try {
 

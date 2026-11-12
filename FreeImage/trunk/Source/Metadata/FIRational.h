@@ -43,8 +43,8 @@ public:
 	/// Constructor with FITAG
 	FIRational(const FITAG *tag);
 
-	/// Constructor with a float
-	FIRational(float value);
+	/// Constructor with a real value: the simplest fraction that rounds to the same float
+	FIRational(double value);
 
 	/// Copy constructor
 	FIRational (const FIRational& r);

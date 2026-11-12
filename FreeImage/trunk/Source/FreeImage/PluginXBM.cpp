@@ -26,75 +26,12 @@
 #include "Utilities.h"
 
 // ==========================================================
-// Internal functions
+// XBM decoding is disabled in this fork (b72b548); recognition only.
+// The format stays registered (FIF_XBM) for ABI compatibility and so it
+// can still be identified, but load_proc and save_proc are NULL, so
+// FreeImage_Load returns NULL and every capability query reports
+// unsupported.
 // ==========================================================
-
-#define MAX_LINE	512
-
-static const char *ERR_XBM_SYNTAX	= "Syntax error";
-static const char *ERR_XBM_LINE		= "Line too long";
-static const char *ERR_XBM_DECL		= "Unable to find a line in the file containing the start of C array declaration (\"static char\" or whatever)";
-static const char *ERR_XBM_EOFREAD	= "EOF / read error";
-static const char *ERR_XBM_WIDTH	= "Invalid width";
-static const char *ERR_XBM_HEIGHT	= "Invalid height";
-static const char *ERR_XBM_MEMORY	= "Out of memory";
-
-/**
-Get a string from a stream. 
-Read the string from the current stream to the first newline character. 
-The result stored in str is appended with a null character.
-@param str Storage location for data 
-@param n Maximum number of characters to read 
-@param io Pointer to the FreeImageIO structure
-@param handle Handle to the stream
-@return Returns str. NULL is returned to indicate an error or an end-of-file condition.
-*/
-static char* 
-readLine(char *str, int n, FreeImageIO *io, fi_handle handle) {
-	char c;
-	int count, i = 0;
-	do {
-		count = io->read_proc(&c, 1, 1, handle);
-		str[i++] = c;
-	} while((c != '\n') && (i < n));
-	if(count <= 0)
-		return NULL;
-	str[i] = '\0';
-	return str;
-}
-
-/**
-Get a char from the stream
-@param io Pointer to the FreeImageIO structure
-@param handle Handle to the stream
-@return Returns the next character in the stream
-*/
-static int 
-readChar(FreeImageIO *io, fi_handle handle) {
-	BYTE c;
-	io->read_proc(&c, 1, 1, handle);
-	return c;
-}
-
-/**
-Read an XBM file into a buffer
-@param io Pointer to the FreeImageIO structure
-@param handle Handle to the stream
-@param widthP (return value) Pointer to the bitmap width
-@param heightP (return value) Pointer to the bitmap height
-@param dataP (return value) Pointer to the bitmap buffer
-@return Returns NULL if OK, returns an error message otherwise
-*/
-static const char* 
-readXBMFile(FreeImageIO *io, fi_handle handle, int *widthP, int *heightP, char **dataP) {
-	return NULL; //Disable XBM file handling
-}
-
-// ==========================================================
-// Plugin Interface
-// ==========================================================
-
-static int s_format_id;
 
 // ==========================================================
 // Plugin Implementation
@@ -127,31 +64,14 @@ MimeType() {
 
 static BOOL DLL_CALLCONV
 Validate(FreeImageIO *io, fi_handle handle) {
-	char magic[8];
-	if(readLine(magic, 7, io, handle)) {
-		if(strcmp(magic, "#define") == 0)
-			return TRUE;
-	}
-	return FALSE;
+	const BYTE xbm_signature[] = { '#', 'd', 'e', 'f', 'i', 'n', 'e' };
+	BYTE signature[sizeof(xbm_signature)] = { 0 };
+
+	if (io->read_proc(signature, 1, sizeof(signature), handle) != sizeof(signature))
+		return FALSE;
+
+	return (memcmp(xbm_signature, signature, sizeof(xbm_signature)) == 0);
 }
-
-static BOOL DLL_CALLCONV
-SupportsExportDepth(int depth) {
-	return FALSE;
-}
-
-static BOOL DLL_CALLCONV 
-SupportsExportType(FREE_IMAGE_TYPE type) {
-	return FALSE;
-}
-
-// ----------------------------------------------------------
-
-static FIBITMAP * DLL_CALLCONV
-Load(FreeImageIO *io, fi_handle handle, int page, int flags, void *data) {
-	return NULL; //Disable XBM file handling
-}
-
 
 // ==========================================================
 //   Init
@@ -159,8 +79,6 @@ Load(FreeImageIO *io, fi_handle handle, int page, int flags, void *data) {
 
 void DLL_CALLCONV
 InitXBM(Plugin *plugin, int format_id) {
-    s_format_id = format_id;
-
 	plugin->format_proc = Format;
 	plugin->description_proc = Description;
 	plugin->extension_proc = Extension;
@@ -169,12 +87,12 @@ InitXBM(Plugin *plugin, int format_id) {
 	plugin->close_proc = NULL;
 	plugin->pagecount_proc = NULL;
 	plugin->pagecapability_proc = NULL;
-	plugin->load_proc = Load;
+	plugin->load_proc = NULL;
 	plugin->save_proc = NULL;
 	plugin->validate_proc = Validate;
 	plugin->mime_proc = MimeType;
-	plugin->supports_export_bpp_proc = SupportsExportDepth;
-	plugin->supports_export_type_proc = SupportsExportType;
+	plugin->supports_export_bpp_proc = NULL;
+	plugin->supports_export_type_proc = NULL;
 	plugin->supports_icc_profiles_proc = NULL;
+	plugin->supports_no_pixels_proc = NULL;
 }
-

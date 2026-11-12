@@ -2,7 +2,7 @@
 // EXR Loader and writer
 //
 // Design and implementation by 
-// - Hervé Drolon (drolon@infonie.fr)
+// - Hervï¿½ Drolon (drolon@infonie.fr)
 // - Mihail Naydenov (mnaydenov@users.sourceforge.net)
 //
 // This file is part of FreeImage 3
@@ -28,16 +28,17 @@
 #pragma warning (disable : 4800) // ImfVersion.h - 'const int' : forcing value to bool 'true' or 'false' (performance warning)
 #endif 
 
-#include "../OpenEXR/IlmImf/ImfIO.h"
-#include "../OpenEXR/Iex/Iex.h"
-#include "../OpenEXR/IlmImf/ImfOutputFile.h"
-#include "../OpenEXR/IlmImf/ImfInputFile.h"
-#include "../OpenEXR/IlmImf/ImfRgbaFile.h"
-#include "../OpenEXR/IlmImf/ImfChannelList.h"
-#include "../OpenEXR/IlmImf/ImfRgba.h"
-#include "../OpenEXR/IlmImf/ImfArray.h"
-#include "../OpenEXR/IlmImf/ImfPreviewImage.h"
-#include "../OpenEXR/Half/half.h"
+#include <OpenEXR/ImfIO.h>
+#include <Iex/Iex.h>
+#include <OpenEXR/ImfOutputFile.h>
+#include <OpenEXR/ImfInputFile.h>
+#include <OpenEXR/ImfRgbaFile.h>
+#include <OpenEXR/ImfChannelList.h>
+#include <OpenEXR/ImfRgba.h>
+#include <OpenEXR/ImfArray.h>
+#include <OpenEXR/ImfPreviewImage.h>
+#include <Imath/half.h>
+#include <climits>
 
 
 // ==========================================================
@@ -56,23 +57,43 @@ class C_IStream : public Imf::IStream {
 private:
     FreeImageIO *_io;
 	fi_handle _handle;
+	int64_t _size;
 
 public:
 	C_IStream (FreeImageIO *io, fi_handle handle) : 
 	  Imf::IStream(""), _io (io), _handle(handle) {
+		long position = _io->tell_proc(_handle);
+		if(position < 0 || _io->seek_proc(_handle, 0, SEEK_END) != 0) {
+			throw Iex::InputExc("Cannot determine EXR stream size");
+		}
+		_size = _io->tell_proc(_handle);
+		if(_size < 0 || _io->seek_proc(_handle, position, SEEK_SET) != 0) {
+			throw Iex::InputExc("Cannot seek EXR input stream");
+		}
 	}
 
 	virtual bool read (char c[/*n*/], int n) {
-		return ((unsigned)n != _io->read_proc(c, 1, n, _handle));
+		if(n < 0 || (unsigned)n != _io->read_proc(c, 1, n, _handle)) {
+			throw Iex::InputExc("Unexpected end of EXR input stream");
+		}
+		return tellg() < (uint64_t)_size;
 	}
 
-	virtual Imath::Int64 tellg() {
-		return _io->tell_proc(_handle);
+	virtual uint64_t tellg() {
+		long position = _io->tell_proc(_handle);
+		if(position < 0) {
+			throw Iex::InputExc("Cannot tell EXR input position");
+		}
+		return (uint64_t)position;
 	}
 
-	virtual void seekg(Imath::Int64 pos) {
-		_io->seek_proc(_handle, (unsigned)pos, SEEK_SET);
+	virtual void seekg(uint64_t pos) {
+		if(pos > LONG_MAX || _io->seek_proc(_handle, (long)pos, SEEK_SET) != 0) {
+			throw Iex::InputExc("Cannot seek EXR input stream");
+		}
 	}
+
+	virtual int64_t size() { return _size; }
 
 	virtual void clear() {
 	}
@@ -100,12 +121,14 @@ public:
 		}
 	}
 
-	virtual Imath::Int64 tellp() {
+	virtual uint64_t tellp() {
 		return _io->tell_proc(_handle);
 	}
 
-	virtual void seekp(Imath::Int64 pos) {
-		_io->seek_proc(_handle, (unsigned)pos, SEEK_SET);
+	virtual void seekp(uint64_t pos) {
+		if(pos > LONG_MAX || _io->seek_proc(_handle, (long)pos, SEEK_SET) != 0) {
+			throw Iex::IoExc("Cannot seek EXR output stream");
+		}
 	}
 };
 
@@ -397,13 +420,10 @@ Load(FreeImageIO *io, fi_handle handle, int page, int flags, void *data) {
 			// build a frame buffer (i.e. what we want on output)
 			Imf::FrameBuffer frameBuffer;
 
-			// allow dataWindow with minimal bounds different form zero
-			size_t offset = - dataWindow.min.x * bytespp - dataWindow.min.y * pitch;
-
 			if(components == 1) {
 				frameBuffer.insert ("Y",	// name
-					Imf::Slice (pixelType,	// type
-					(char*)(bits + offset), // base
+					Imf::Slice::Make (pixelType,	// type
+					bits, dataWindow,
 					bytespp,				// xStride
 					pitch,					// yStride
 					1, 1,					// x/y sampling
@@ -414,8 +434,8 @@ Load(FreeImageIO *io, fi_handle handle, int page, int flags, void *data) {
 				for(int c = 0; c < components; c++) {
 					frameBuffer.insert (
 						channel_name[c],					// name
-						Imf::Slice (pixelType,				// type
-						(char*)(bits + c * sizeof(float) + offset), // base
+						Imf::Slice::Make (pixelType,				// type
+						bits + c * sizeof(float), dataWindow,
 						bytespp,							// xStride
 						pitch,								// yStride
 						1, 1,								// x/y sampling

@@ -7,9 +7,11 @@ This is a fork of the unmaintained FreeImage library (https://freeimage.sourcefo
 
 ## Build
 
-FreeImage has been updated to build with Visual Studio 2022 and the C++ v143 toolset. You will need to add the "C++ Core Features" and "MSVC v143 - VS 2022 C++ x64/86 build tools" components when installing Visual Studio to build.
+FreeImage builds with Visual Studio 2026 and the C++ v145 toolset (x64). Install the "Desktop development with C++" workload, which includes the MSVC v145 build tools and a Windows SDK.
 
-Open FreeImage.2022.sln to start.
+Open FreeImage/trunk/FreeImage.2026.sln to start.
+
+See FreeImage/trunk/SECURITY-UPDATES.md for the supported image formats, bundled dependency versions, and the CVE regression test suite.
 
 ## Copy of /FreeImage/Trunk/README.md from original author
 

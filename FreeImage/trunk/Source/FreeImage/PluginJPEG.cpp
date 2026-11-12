@@ -1229,6 +1229,12 @@ Load(FreeImageIO *io, fi_handle handle, int page, int flags, void *data) {
 
 			jpeg_start_decompress(&cinfo);
 
+			if(!((cinfo.out_color_space == JCS_GRAYSCALE && cinfo.output_components == 1) ||
+			     (cinfo.out_color_space == JCS_RGB && cinfo.output_components == 3) ||
+			     (cinfo.out_color_space == JCS_CMYK && cinfo.output_components == 4))) {
+				throw "Unsupported JPEG output color space or component count";
+			}
+
 			// step 5b: allocate dib and init header
 
 			if((cinfo.output_components == 4) && (cinfo.out_color_space == JCS_CMYK)) {

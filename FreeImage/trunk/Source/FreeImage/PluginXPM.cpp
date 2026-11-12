@@ -39,56 +39,12 @@
 #include "Utilities.h"
 
 // ==========================================================
-// Plugin Interface
+// XPM loading and saving are disabled in this fork (b72b548); recognition only.
+// The format stays registered (FIF_XPM) for ABI compatibility and so it
+// can still be identified, but load_proc and save_proc are NULL, so
+// FreeImage_Load returns NULL and every capability query reports
+// unsupported.
 // ==========================================================
-static int s_format_id;
-
-// ==========================================================
-// Internal Functions
-// ==========================================================
-
-// read in and skip all junk until we find a certain char
-static BOOL
-FindChar(FreeImageIO *io, fi_handle handle, BYTE look_for) {
-	BYTE c;
-	io->read_proc(&c, sizeof(BYTE), 1, handle);
-	while(c != look_for) {
-		if( io->read_proc(&c, sizeof(BYTE), 1, handle) != 1 )
-			return FALSE;
-	}
-	return TRUE;
-}
-
-// find start of string, read data until ending quote found, allocate memory and return a string
-static char *
-ReadString(FreeImageIO *io, fi_handle handle) {
-	if( !FindChar(io, handle,'"') )
-		return NULL;
-	BYTE c;
-	std::string s;
-	io->read_proc(&c, sizeof(BYTE), 1, handle);
-	while(c != '"') {
-		s += c;
-		if( io->read_proc(&c, sizeof(BYTE), 1, handle) != 1 )
-			return NULL;
-	}
-	char *cstr = (char *)malloc(s.length()+1);
-	strcpy(cstr,s.c_str());
-	return cstr;
-}
-
-static char *
-Base92(unsigned int num) {
-	static char b92[16]; //enough for more then 64 bits
-	static char digit[] = " .XoO+@#$%&*=-;:>,<1234567890qwertyuipasdfghjklzxcvbnmMNBVCZASDFGHJKLPIUYTREWQ!~^/()_`'][{}|";
-	b92[15] = '\0';
-	int i = 14;
-	do {
-		b92[i--] = digit[num % 92];
-		num /= 92;
-	} while( num && i >= 0 );
-	return b92+i+1;
-}
 
 // ==========================================================
 // Plugin Implementation
@@ -133,45 +89,12 @@ Validate(FreeImageIO *io, fi_handle handle) {
 	return FALSE;
 }
 
-static BOOL DLL_CALLCONV
-SupportsExportDepth(int depth) {
-	return (
-			(depth == 8) ||
-			(depth == 24)
-		);
-}
-
-static BOOL DLL_CALLCONV
-SupportsExportType(FREE_IMAGE_TYPE type) {
-	return (type == FIT_BITMAP) ? TRUE : FALSE;
-}
-
-static BOOL DLL_CALLCONV
-SupportsNoPixels() {
-	return TRUE;
-}
-
-// ----------------------------------------------------------
-
-static FIBITMAP * DLL_CALLCONV
-Load(FreeImageIO *io, fi_handle handle, int page, int flags, void *data) {
-	return NULL; // Disable XPM file handling
-}
-
-static BOOL DLL_CALLCONV
-Save(FreeImageIO *io, FIBITMAP *dib, fi_handle handle, int page, int flags, void *data) {
-	return FALSE; // Disable XPM file handling
-}
-
 // ==========================================================
 //   Init
 // ==========================================================
 
 void DLL_CALLCONV
-InitXPM(Plugin *plugin, int format_id)
-{
-    s_format_id = format_id;
-
+InitXPM(Plugin *plugin, int format_id) {
 	plugin->format_proc = Format;
 	plugin->description_proc = Description;
 	plugin->extension_proc = Extension;
@@ -180,13 +103,12 @@ InitXPM(Plugin *plugin, int format_id)
 	plugin->close_proc = NULL;
 	plugin->pagecount_proc = NULL;
 	plugin->pagecapability_proc = NULL;
-	plugin->load_proc = Load;
-	plugin->save_proc = Save;
+	plugin->load_proc = NULL;
+	plugin->save_proc = NULL;
 	plugin->validate_proc = Validate;
 	plugin->mime_proc = MimeType;
-	plugin->supports_export_bpp_proc = SupportsExportDepth;
-	plugin->supports_export_type_proc = SupportsExportType;
+	plugin->supports_export_bpp_proc = NULL;
+	plugin->supports_export_type_proc = NULL;
 	plugin->supports_icc_profiles_proc = NULL;
-	plugin->supports_no_pixels_proc = SupportsNoPixels;
+	plugin->supports_no_pixels_proc = NULL;
 }
-

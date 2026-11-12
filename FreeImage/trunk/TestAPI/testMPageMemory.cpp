@@ -39,7 +39,7 @@ extractPagesFromMemory(FREE_IMAGE_FORMAT fif, FIMEMORY *stream) {
 			if(dib) {
 				// save the page
 				sprintf(filename, "page%d.%s", page, FreeImage_GetFormatFromFIF(fif));
-				FreeImage_Save(fif, dib, filename, 0);
+				FreeImage_Save(fif, dib, testOutputPath(filename).c_str(), 0);
 				// Unload the bitmap (do not apply any change to src)
 				FreeImage_UnlockPage(src, dib, FALSE);
 			} else {
@@ -161,7 +161,7 @@ loadBuffer(const char *lpszPathName, BYTE **buffer, DWORD *length) {
 	return FALSE;
 }
 
-BOOL testMemoryStreamMultiPageOpenSave(const char *lpszPathName, char *output, int input_flag, int output_flag) {
+BOOL testMemoryStreamMultiPageOpenSave(const char *lpszPathName, const char *output, int input_flag, int output_flag) {
 	BOOL bSuccess = FALSE;
 
 	BYTE *buffer = NULL;
@@ -261,11 +261,11 @@ void testMultiPageMemory(const char *lpszPathName) {
 	testLoadMultiBitmapFromMemory(lpszPathName);
 
 	// test FreeImage_SaveMultiBitmapToMemory
-	bSuccess = testSaveMultiBitmapToMemory("sample.tif", "mpage-mstream.tif", 0);
+	bSuccess = testSaveMultiBitmapToMemory(lpszPathName, testOutputPath("mpage-mstream.tif").c_str(), 0);
 	assert(bSuccess);
 
 	// test FreeImage_LoadMultiBitmapFromMemory & FreeImage_SaveMultiBitmapToMemory
-	bSuccess = testMemoryStreamMultiPageOpenSave("sample.tif", "mpage-mstream-redirect.tif", 0, 0);
+	bSuccess = testMemoryStreamMultiPageOpenSave(lpszPathName, testOutputPath("mpage-mstream-redirect.tif").c_str(), 0, 0);
 	assert(bSuccess);
 
 }
